@@ -13,8 +13,8 @@ dist/
 *.spec
 
 # Dados de usuário e banco local (portabilidade)
-data/*
-!data/.gitkeep
+backups/*
+!backups/.gitkeep
 
 # IDEs
 .vscode/
