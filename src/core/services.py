@@ -106,3 +106,41 @@ class NotebookService:
         if re.match(r"^#(?:[0-9a-fA-F]{3}){1,2}$", color):
             return color
         return default
+
+    def rename_document(self, doc_id: str, new_title: str):
+        """Renomeia apenas o título de um documento."""
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE documents SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_title.strip(), doc_id)
+            )
+
+    def delete_document(self, doc_id: str):
+        """Exclui o documento e todas as suas notas associadas (via CASCADE)."""
+        with self.db.get_connection() as conn:
+            conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+
+    def duplicate_document(self, doc_id: str) -> Optional[Document]:
+        """Clona um documento e recria seus termos com novas âncoras independentes."""
+        original = self.get_document(doc_id)
+        if not original:
+            return None
+
+        terms = self.list_terms_for_document(doc_id)
+        new_content = original.content
+        new_terms_to_insert = []
+
+        # Gera novas chaves para evitar conflito de UNIQUE no banco
+        for t in terms:
+            new_anchor = f"anc_{uuid.uuid4().hex[:8]}"
+            old_token = f"[[{t.term_text}|{t.anchor_key}]]"
+            new_token = f"[[{t.term_text}|{new_anchor}]]"
+            new_content = new_content.replace(old_token, new_token)
+            new_terms_to_insert.append((t.term_text, new_anchor, t.note_content, getattr(t, 'color', '#89b4fa')))
+
+        new_doc = self.create_document(f"{original.title} (Cópia)", new_content)
+
+        for term_text, new_anchor, note_content, color in new_terms_to_insert:
+            self.add_term_note(new_doc.id, term_text, new_anchor, note_content, color)
+
+        return new_doc

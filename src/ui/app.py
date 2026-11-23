@@ -1,17 +1,51 @@
 import sys
 import uuid
+import ctypes
+from ctypes import c_int, sizeof
 from pathlib import Path
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QListWidget, QListWidgetItem, QTextBrowser, QPlainTextEdit,
     QLabel, QPushButton, QLineEdit, QTextEdit, QMessageBox, QStackedWidget,
-    QInputDialog, QSpinBox, QColorDialog
+    QInputDialog, QSpinBox, QColorDialog, QMenu
 )
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, QPoint, QObject, QEvent
 
 from src.core.services import NotebookService
 from src.core.parser import TextParser
+
+# =========================================================================
+# Utilitário Nativo do Windows: Barra de Título Escura/Moderna (DWM API)
+# =========================================================================
+def apply_windows_dark_titlebar(widget: QWidget, dark: bool = True):
+    """Ativa o modo escuro imersivo na barra nativa de janelas do Windows 10/11."""
+    if sys.platform != "win32":
+        return
+    try:
+        hwnd = int(widget.winId())
+        # Atributo 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (Windows 10 build 18985+ e Windows 11)
+        # Atributo 19 = Fallback para builds anteriores do Windows 10
+        val = c_int(1 if dark else 0)
+        res = ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(val), sizeof(val))
+        if res != 0:
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 19, ctypes.byref(val), sizeof(val))
+    except Exception:
+        pass
+
+
+class WindowThemeFilter(QObject):
+    """Intercepta a abertura de qualquer janela/popup para aplicar o tema na barra de título."""
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.Show and isinstance(watched, QWidget) and watched.isWindow():
+            is_dark = (self.main_window.current_theme == "dark")
+            apply_windows_dark_titlebar(watched, is_dark)
+        return super().eventFilter(watched, event)
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -23,18 +57,16 @@ class MainWindow(QMainWindow):
         self.current_document_id = None
         self.current_anchor_key = None
 
-        # Carrega preferências com validação estrita (anti-crash)
         self.current_theme = self.service.get_theme("dark")
         self.font_size = self.service.get_font_size(15)
         default_color = "#cdd6f4" if self.current_theme == "dark" else "#1f2328"
         self.text_color = self.service.get_text_color(default_color)
 
-        self._apply_theme(self.current_theme)
         self._setup_ui()
+        self._apply_theme(self.current_theme)
         self._load_documents()
 
     def _apply_theme(self, theme_name: str):
-        # Whitelist estrita para prevenir Path Traversal
         if theme_name not in {"dark", "light"}:
             theme_name = "dark"
 
@@ -45,6 +77,9 @@ class MainWindow(QMainWindow):
             self.setStyleSheet(qss_file.read_text(encoding="utf-8"))
         self.service.set_setting("theme", theme_name)
 
+        # Atualiza a barra de título da janela principal
+        apply_windows_dark_titlebar(self, dark=(theme_name == "dark"))
+
     def _setup_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -54,7 +89,9 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
 
+        # ==========================================
         # COLUNA 1: Lista de Documentos
+        # ==========================================
         col_docs = QWidget()
         layout_docs = QVBoxLayout(col_docs)
         layout_docs.addWidget(QLabel("<b>Meus Documentos</b>"))
@@ -65,15 +102,18 @@ class MainWindow(QMainWindow):
 
         self.list_docs = QListWidget()
         self.list_docs.itemClicked.connect(self._on_document_selected)
+        self.list_docs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_docs.customContextMenuRequested.connect(self._show_document_context_menu)
         layout_docs.addWidget(self.list_docs)
 
         splitter.addWidget(col_docs)
 
+        # ==========================================
         # COLUNA 2: Centro (Texto & Customização)
+        # ==========================================
         col_center = QWidget()
         layout_center = QVBoxLayout(col_center)
 
-        # Barra 1: Ações do Documento
         bar_top = QHBoxLayout()
         self.input_doc_title = QLineEdit()
         self.input_doc_title.setPlaceholderText("Título do documento...")
@@ -90,7 +130,6 @@ class MainWindow(QMainWindow):
 
         layout_center.addLayout(bar_top)
 
-        # Barra 2: Formatação & Alternador de Tema
         bar_format = QHBoxLayout()
         bar_format.addWidget(QLabel("Fonte:"))
 
@@ -113,7 +152,6 @@ class MainWindow(QMainWindow):
 
         layout_center.addLayout(bar_format)
 
-        # Stack Leitor vs Editor
         self.stack_center = QStackedWidget()
 
         self.reader = QTextBrowser()
@@ -127,7 +165,9 @@ class MainWindow(QMainWindow):
         layout_center.addWidget(self.stack_center)
         splitter.addWidget(col_center)
 
+        # ==========================================
         # COLUNA 3: Painel Lateral
+        # ==========================================
         col_side = QWidget()
         layout_side = QVBoxLayout(col_side)
         layout_side.addWidget(QLabel("<b>Painel de Contexto / Nota</b>"))
@@ -150,7 +190,60 @@ class MainWindow(QMainWindow):
         splitter.setSizes([220, 600, 280])
 
     # ==========================================
-    # Customizações e Persistência
+    # Menu de Contexto (Botão Direito)
+    # ==========================================
+
+    def _show_document_context_menu(self, position: QPoint):
+        item = self.list_docs.itemAt(position)
+        if not item:
+            return
+
+        doc_id = item.data(Qt.ItemDataRole.UserRole)
+        doc_title = item.text()
+
+        menu = QMenu(self)
+        action_rename = menu.addAction("✏️ Renomear")
+        action_duplicate = menu.addAction("📄 Duplicar / Criar Cópia")
+        menu.addSeparator()
+        action_delete = menu.addAction("🗑️ Excluir Documento")
+
+        selected_action = menu.exec(self.list_docs.mapToGlobal(position))
+
+        if selected_action == action_rename:
+            new_title, ok = QInputDialog.getText(self, "Renomear Documento", "Novo título:", text=doc_title)
+            if ok and new_title.strip() and new_title.strip() != doc_title:
+                self.service.rename_document(doc_id, new_title.strip())
+                item.setText(new_title.strip())
+                if self.current_document_id == doc_id:
+                    self.input_doc_title.setText(new_title.strip())
+
+        elif selected_action == action_duplicate:
+            new_doc = self.service.duplicate_document(doc_id)
+            if new_doc:
+                self._load_documents()
+                self._select_document_by_id(new_doc.id)
+
+        elif selected_action == action_delete:
+            confirm = QMessageBox.question(
+                self,
+                "Confirmar Exclusão",
+                f"Tem certeza que deseja excluir o documento:\n'{doc_title}'?\n\nTodas as notas vinculadas serão apagadas.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if confirm == QMessageBox.StandardButton.Yes:
+                self.service.delete_document(doc_id)
+                self._load_documents()
+
+    def _select_document_by_id(self, doc_id: str):
+        for i in range(self.list_docs.count()):
+            if self.list_docs.item(i).data(Qt.ItemDataRole.UserRole) == doc_id:
+                self.list_docs.setCurrentRow(i)
+                self._load_document_data(doc_id)
+                break
+
+    # ==========================================
+    # Customizações e Temas
     # ==========================================
 
     def _toggle_theme(self):
@@ -215,17 +308,21 @@ class MainWindow(QMainWindow):
         if docs:
             self.list_docs.setCurrentRow(0)
             self._load_document_data(docs[0].id)
+        else:
+            self.current_document_id = None
+            self.input_doc_title.clear()
+            self.editor.clear()
+            self.reader.clear()
+            self.lbl_term_title.setText("<i>Nenhum documento aberto</i>")
+            self.txt_term_note.clear()
+            self.btn_save_note.setEnabled(False)
 
     def _create_new_document(self):
         title, ok = QInputDialog.getText(self, "Novo Documento", "Título do documento:")
         if ok and title.strip():
             doc = self.service.create_document(title.strip(), "Cole ou digite seu texto aqui...")
             self._load_documents()
-            for i in range(self.list_docs.count()):
-                if self.list_docs.item(i).data(Qt.ItemDataRole.UserRole) == doc.id:
-                    self.list_docs.setCurrentRow(i)
-                    self._load_document_data(doc.id)
-                    break
+            self._select_document_by_id(doc.id)
 
     def _on_document_selected(self, item: QListWidgetItem):
         doc_id = item.data(Qt.ItemDataRole.UserRole)
@@ -247,6 +344,9 @@ class MainWindow(QMainWindow):
         self.btn_save_note.setEnabled(False)
 
     def _toggle_mode(self):
+        if not self.current_document_id:
+            return
+
         if self.stack_center.currentIndex() == 0:
             self.stack_center.setCurrentIndex(1)
             self.btn_toggle_mode.setText("Salvar e Ir p/ Leitura")
@@ -255,7 +355,6 @@ class MainWindow(QMainWindow):
             new_content = self.editor.toPlainText()
             new_title = self.input_doc_title.text().strip() or "Sem título"
 
-            # Utiliza método desacoplado no service (sem SQL na UI)
             self.service.update_document(self.current_document_id, new_title, new_content)
 
             self.stack_center.setCurrentIndex(0)
@@ -269,6 +368,9 @@ class MainWindow(QMainWindow):
                 current_item.setText(new_title)
 
     def _mark_selected_term(self):
+        if not self.current_document_id:
+            return
+
         cursor = self.editor.textCursor()
         selected_text = cursor.selectedText().strip()
 
@@ -318,7 +420,6 @@ class MainWindow(QMainWindow):
             return
 
         new_note = self.txt_term_note.toPlainText().strip()
-        # Utiliza método desacoplado no service (sem SQL na UI)
         self.service.update_term_note(self.current_anchor_key, new_note)
         QMessageBox.information(self, "Salvo", "Nota atualizada com sucesso no banco de dados!")
 
@@ -326,5 +427,10 @@ class MainWindow(QMainWindow):
 def run_app():
     app = QApplication(sys.argv)
     window = MainWindow()
+    
+    # Registra o filtro global para estilizar caixas de diálogo e popups
+    theme_filter = WindowThemeFilter(window)
+    app.installEventFilter(theme_filter)
+
     window.show()
     sys.exit(app.exec())
