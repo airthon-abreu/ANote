@@ -1,0 +1,82 @@
+/* Paleta base: Slate / Dark moderna */
+QWidget {
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+    font-family: "Segoe UI", -apple-system, Roboto, sans-serif;
+    font-size: 13px;
+}
+
+/* Divisores e Listas */
+QSplitter::handle {
+    background-color: #313244;
+    width: 2px;
+}
+
+QListWidget {
+    background-color: #181825;
+    border: 1px solid #313244;
+    border-radius: 8px;
+    padding: 6px;
+    outline: none;
+}
+
+QListWidget::item {
+    padding: 10px;
+    border-radius: 6px;
+    margin-bottom: 4px;
+}
+
+QListWidget::item:hover {
+    background-color: #313244;
+}
+
+QListWidget::item:selected {
+    background-color: #45475a;
+    color: #89b4fa;
+    font-weight: bold;
+}
+
+/* Campos de entrada (Inputs) e Editores */
+QLineEdit, QPlainTextEdit, QTextEdit, QTextBrowser {
+    background-color: #181825;
+    border: 1px solid #313244;
+    border-radius: 8px;
+    padding: 10px;
+    color: #cdd6f4;
+    selection-background-color: #f5c2e7;
+    selection-color: #11111b;
+}
+
+QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus {
+    border: 1px solid #89b4fa;
+}
+
+/* Botões com efeito visual e clique */
+QPushButton {
+    background-color: #313244;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-weight: 600;
+}
+
+QPushButton:hover {
+    background-color: #45475a;
+    border-color: #585b70;
+}
+
+QPushButton:pressed {
+    background-color: #585b70;
+}
+
+QPushButton:disabled {
+    background-color: #181825;
+    color: #585b70;
+    border-color: #313244;
+}
+
+/* Títulos */
+QLabel {
+    background-color: transparent;
+}

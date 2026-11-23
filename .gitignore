@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.venv/
+env/
+venv/
+
+# Build & Dist (PyInstaller)
+build/
+dist/
+*.spec
+
+# Dados de usuário e banco local (portabilidade)
+data/*
+!data/.gitkeep
+
+# IDEs
+.vscode/
+.idea/
+# Handoff snapshot
+handoff_projeto.txt
