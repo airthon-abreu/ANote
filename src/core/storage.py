@@ -11,10 +11,6 @@ class Database:
 
     @contextmanager
     def get_connection(self) -> Generator[sqlite3.Connection, None, None]:
-        """
-        Abre conexão com timeout estendido, suporte a WAL e garantia
-        de integridade referencial com fechamento determinístico.
-        """
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
@@ -30,12 +26,12 @@ class Database:
             conn.close()
 
     def _init_db(self):
-        """Inicializa as tabelas com índices de busca e migração segura."""
         with self.get_connection() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS documents (
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
+                    category TEXT DEFAULT 'Geral',
                     content TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -47,8 +43,17 @@ class Database:
                     term_text TEXT NOT NULL,
                     anchor_key TEXT UNIQUE NOT NULL,
                     note_content TEXT NOT NULL,
-                    color TEXT DEFAULT '#89b4fa',
+                    color TEXT DEFAULT '#ffe066',
                     created_at TEXT NOT NULL,
+                    FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS document_history (
+                    id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    saved_at TEXT NOT NULL,
                     FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
                 );
 
@@ -59,9 +64,13 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_terms_document ON terms(document_id);
                 CREATE INDEX IF NOT EXISTS idx_terms_anchor ON terms(anchor_key);
+                CREATE INDEX IF NOT EXISTS idx_history_doc ON document_history(document_id);
             """)
 
-            # Migração suave para bases legadas
-            columns = [row["name"] for row in conn.execute("PRAGMA table_info(terms);").fetchall()]
-            if "color" not in columns:
-                conn.execute("ALTER TABLE terms ADD COLUMN color TEXT DEFAULT '#89b4fa';")
+            doc_cols = [r["name"] for r in conn.execute("PRAGMA table_info(documents);").fetchall()]
+            if "category" not in doc_cols:
+                conn.execute("ALTER TABLE documents ADD COLUMN category TEXT DEFAULT 'Geral';")
+
+            term_cols = [r["name"] for r in conn.execute("PRAGMA table_info(terms);").fetchall()]
+            if "color" not in term_cols:
+                conn.execute("ALTER TABLE terms ADD COLUMN color TEXT DEFAULT '#ffe066';")

@@ -1,9 +1,19 @@
 import re
 import uuid
 import html
-from typing import List, Optional, Dict, Any
+from datetime import datetime
+from typing import List, Optional, Dict, Set
 from src.core.storage import Database
 from src.core.models import Document, Term
+
+def extract_anchors_from_html(content: str) -> Set[str]:
+    """Extrai todas as chaves de âncoras realmente presentes no texto."""
+    if not content:
+        return set()
+    anchors = set(re.findall(r'href=["\']anchor:([^"\']+)["\']', content))
+    anchors.update(re.findall(r'\|([^\]|]+)\]\]', content))
+    return anchors
+
 
 class NotebookService:
     def __init__(self, db: Optional[Database] = None):
@@ -11,31 +21,46 @@ class NotebookService:
 
     # --- Operações de Documento ---
 
-    def create_document(self, title: str, content: str) -> Document:
-        doc = Document(title=title.strip() or "Sem título", content=content)
+    def create_document(self, title: str, content: str, category: str = "Geral") -> Document:
+        doc = Document(title=title.strip() or "Sem título", content=content, category=category.strip() or "Geral")
         with self.db.get_connection() as conn:
             conn.execute(
-                "INSERT INTO documents (id, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (doc.id, doc.title, doc.content, doc.created_at, doc.updated_at)
+                "INSERT INTO documents (id, title, category, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (doc.id, doc.title, doc.category, doc.content, doc.created_at, doc.updated_at)
             )
+        self.save_history_snapshot(doc.id, doc.title, doc.content)
         return doc
 
-    def list_documents(self) -> List[Document]:
+    def list_documents(self, category_filter: Optional[str] = None) -> List[Document]:
         with self.db.get_connection() as conn:
-            rows = conn.execute("SELECT * FROM documents ORDER BY updated_at DESC").fetchall()
+            if category_filter and category_filter != "Todas":
+                rows = conn.execute(
+                    "SELECT * FROM documents WHERE category = ? ORDER BY updated_at DESC", 
+                    (category_filter,)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM documents ORDER BY updated_at DESC").fetchall()
             return [Document(**dict(row)) for row in rows]
+
+    def list_categories(self) -> List[str]:
+        with self.db.get_connection() as conn:
+            rows = conn.execute("SELECT DISTINCT category FROM documents ORDER BY category ASC").fetchall()
+            cats = [row["category"] for row in rows if row["category"]]
+            return cats if cats else ["Geral"]
 
     def get_document(self, doc_id: str) -> Optional[Document]:
         with self.db.get_connection() as conn:
             row = conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
             return Document(**dict(row)) if row else None
 
-    def update_document(self, doc_id: str, title: str, content: str):
+    def update_document(self, doc_id: str, title: str, content: str, category: str = "Geral"):
         with self.db.get_connection() as conn:
             conn.execute(
-                "UPDATE documents SET title = ?, content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (title.strip() or "Sem título", content, doc_id)
+                "UPDATE documents SET title = ?, content = ?, category = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (title.strip() or "Sem título", content, category.strip() or "Geral", doc_id)
             )
+        self.save_history_snapshot(doc_id, title, content)
+        self.clean_orphaned_terms(doc_id, content)
 
     def rename_document(self, doc_id: str, new_title: str):
         with self.db.get_connection() as conn:
@@ -44,12 +69,18 @@ class NotebookService:
                 (new_title.strip() or "Sem título", doc_id)
             )
 
+    def update_document_category(self, doc_id: str, category: str):
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE documents SET category = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (category.strip() or "Geral", doc_id)
+            )
+
     def delete_document(self, doc_id: str):
         with self.db.get_connection() as conn:
             conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
 
     def duplicate_document(self, doc_id: str) -> Optional[Document]:
-        """Duplica um documento remapeando tags HTML e tokens legados para novas chaves exclusivas."""
         original = self.get_document(doc_id)
         if not original:
             return None
@@ -60,27 +91,79 @@ class NotebookService:
 
         for t in terms:
             new_anchor = f"anc_{uuid.uuid4().hex[:8]}"
-            # Substituição precisa em links HTML
             new_content = re.sub(
                 rf'href=["\']anchor:{re.escape(t.anchor_key)}["\']',
                 f'href="anchor:{new_anchor}"',
                 new_content
             )
-            # Substituição para tokens legados se existirem
             new_content = new_content.replace(f"|{t.anchor_key}]]", f"|{new_anchor}]]")
+            new_terms_to_insert.append((t.term_text, new_anchor, t.note_content, getattr(t, 'color', '#ffe066')))
 
-            new_terms_to_insert.append((t.term_text, new_anchor, t.note_content, getattr(t, 'color', '#89b4fa')))
-
-        new_doc = self.create_document(f"{original.title} (Cópia)", new_content)
-
+        new_doc = self.create_document(f"{original.title} (Cópia)", new_content, original.category)
         for term_text, new_anchor, note_content, color in new_terms_to_insert:
             self.add_term_note(new_doc.id, term_text, new_anchor, note_content, color)
 
         return new_doc
 
-    # --- Operações de Termos / Anotações ---
+    # --- Histórico de Modificações (Snapshots) ---
 
-    def add_term_note(self, document_id: str, term_text: str, anchor_key: str, note_content: str, color: str = "#89b4fa") -> Term:
+    def save_history_snapshot(self, doc_id: str, title: str, content: str):
+        history_id = str(uuid.uuid4())
+        now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "INSERT INTO document_history (id, document_id, title, content, saved_at) VALUES (?, ?, ?, ?, ?)",
+                (history_id, doc_id, title, content, now_str)
+            )
+            conn.execute("""
+                DELETE FROM document_history WHERE id NOT IN (
+                    SELECT id FROM document_history WHERE document_id = ? ORDER BY saved_at DESC LIMIT 20
+                ) AND document_id = ?
+            """, (doc_id, doc_id))
+
+    def list_history_snapshots(self, doc_id: str) -> List[Dict]:
+        with self.db.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT id, title, saved_at, length(content) as content_len FROM document_history WHERE document_id = ? ORDER BY saved_at DESC", 
+                (doc_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_history_snapshot(self, history_id: str) -> Optional[Dict]:
+        with self.db.get_connection() as conn:
+            row = conn.execute("SELECT * FROM document_history WHERE id = ?", (history_id,)).fetchone()
+            return dict(row) if row else None
+
+    # --- Saneamento e Termos / Anotações ---
+
+    def clean_orphaned_terms(self, document_id: str, content: str):
+        """Purga do banco qualquer nota cujo termo já não exista mais no texto."""
+        active_anchors = extract_anchors_from_html(content)
+        with self.db.get_connection() as conn:
+            rows = conn.execute("SELECT anchor_key FROM terms WHERE document_id = ?", (document_id,)).fetchall()
+            for r in rows:
+                key = r["anchor_key"]
+                if key not in active_anchors:
+                    conn.execute("DELETE FROM terms WHERE anchor_key = ?", (key,))
+
+    def count_terms(self, document_id: str, content: Optional[str] = None) -> int:
+        """Retorna a contagem exata e real de termos marcados presentes no texto."""
+        if content is not None:
+            active_anchors = extract_anchors_from_html(content)
+            self.clean_orphaned_terms(document_id, content)
+            return len(active_anchors)
+
+        doc = self.get_document(document_id)
+        if doc:
+            active_anchors = extract_anchors_from_html(doc.content)
+            self.clean_orphaned_terms(document_id, doc.content)
+            return len(active_anchors)
+
+        with self.db.get_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) as count FROM terms WHERE document_id = ?", (document_id,)).fetchone()
+            return row["count"] if row else 0
+
+    def add_term_note(self, document_id: str, term_text: str, anchor_key: str, note_content: str, color: str = "#ffe066") -> Term:
         term = Term(
             document_id=document_id,
             term_text=term_text,
@@ -102,6 +185,10 @@ class NotebookService:
             return Term(**dict(row)) if row else None
 
     def list_terms_for_document(self, document_id: str) -> List[Term]:
+        doc = self.get_document(document_id)
+        if doc:
+            self.clean_orphaned_terms(document_id, doc.content)
+
         with self.db.get_connection() as conn:
             rows = conn.execute("SELECT * FROM terms WHERE document_id = ? ORDER BY created_at ASC", (document_id,)).fetchall()
             return [Term(**dict(row)) for row in rows]
@@ -111,44 +198,15 @@ class NotebookService:
             conn.execute("UPDATE terms SET note_content = ? WHERE anchor_key = ?", (new_note, anchor_key))
 
     def update_term_color(self, doc_id: str, anchor_key: str, new_color: str):
-        """Atualiza a cor no banco de dados e sincroniza o estilo inline no HTML do documento."""
         with self.db.get_connection() as conn:
             conn.execute("UPDATE terms SET color = ? WHERE anchor_key = ?", (new_color, anchor_key))
 
-            doc_row = conn.execute("SELECT content FROM documents WHERE id = ?", (doc_id,)).fetchone()
-            if doc_row:
-                content = doc_row["content"]
-                # Substitui background-color do link específico
-                pattern = rf'(<a\s+[^>]*href=["\']anchor:{re.escape(anchor_key)}["\'][^>]*style=["\'][^"\']*background-color:\s*)(#[0-9a-fA-F]{{3,6}})'
-                if re.search(pattern, content):
-                    content = re.sub(pattern, rf'\g<1>{new_color}', content)
-                else:
-                    # Caso o estilo esteja formatado diferente
-                    replace_tag = (
-                        rf'<a href="anchor:{anchor_key}" style="background-color: {new_color}; color: #11111b; '
-                        rf'padding: 2px 6px; border-radius: 4px; text-decoration: none; font-weight: bold;"'
-                    )
-                    content = re.sub(rf'<a\s+[^>]*href=["\']anchor:{re.escape(anchor_key)}["\'][^>]*', replace_tag, content)
-
-                conn.execute("UPDATE documents SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (content, doc_id))
-
     def delete_term(self, doc_id: str, anchor_key: str):
-        """Exclui a anotação da tabela e remove a tag âncora do HTML mantendo o texto visível."""
+        """Remove o registro da nota no SQLite."""
         with self.db.get_connection() as conn:
             conn.execute("DELETE FROM terms WHERE anchor_key = ?", (anchor_key,))
-            doc_row = conn.execute("SELECT content FROM documents WHERE id = ?", (doc_id,)).fetchone()
-            if doc_row:
-                content = doc_row["content"]
-                # Desembrulha a tag <a> mantendo apenas o texto interno
-                unwrapped_content = re.sub(
-                    rf'<a\s+[^>]*href=["\']anchor:{re.escape(anchor_key)}["\'][^>]*>(.*?)</a>',
-                    r'\1',
-                    content,
-                    flags=re.DOTALL
-                )
-                conn.execute("UPDATE documents SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (unwrapped_content, doc_id))
 
-    # --- Preferências do Usuário ---
+    # --- Configurações ---
 
     def get_setting(self, key: str, default: str = "") -> str:
         with self.db.get_connection() as conn:
@@ -176,11 +234,9 @@ class NotebookService:
 
     def get_text_color(self, default: str = "#cdd6f4") -> str:
         color = self.get_setting("text_color", default)
-        if re.match(r"^#(?:[0-9a-fA-F]{3}){1,2}$", color):
-            return color
-        return default
+        return color if re.match(r"^#(?:[0-9a-fA-F]{3}){1,2}$", color) else default
 
-    # --- Exportação e Importação ---
+    # --- Exportação / Importação ---
 
     def export_to_printable_html(self, doc_id: str) -> Optional[str]:
         doc = self.get_document(doc_id)
@@ -189,15 +245,13 @@ class NotebookService:
 
         terms = self.list_terms_for_document(doc_id)
         content = doc.content
-
-        # Limpeza de fontes com valores fixos em pixels
         content = re.sub(r'font-size:\s*[^;"]+;?', '', content)
         content = re.sub(r'color:\s*#[0-9a-fA-F]+;?', '', content)
 
         for t in terms:
             badge = (
                 f'<span style="background-color: {t.color}; color: #111111; '
-                f'padding: 2px 6px; border-radius: 4px; font-weight: bold;">{html.escape(t.term_text)}</span>'
+                f'padding: 2px 6px; border-radius: 4px;">{html.escape(t.term_text)}</span>'
             )
             content = re.sub(rf'<a\s+[^>]*href=["\']anchor:{re.escape(t.anchor_key)}["\'][^>]*>(.*?)</a>', badge, content)
 
@@ -237,35 +291,24 @@ class NotebookService:
             font-size: 11.5pt;
             color: #1e293b;
             line-height: 1.6;
-            margin: 0;
-            padding: 0;
+            margin: 0; padding: 0;
         }}
         .header-box {{
             border-bottom: 2px solid #0f172a;
             padding-bottom: 10px;
             margin-bottom: 20px;
         }}
-        .doc-title {{
-            font-size: 20pt;
-            font-weight: 800;
-            color: #0f172a;
-            margin: 0 0 4px 0;
-        }}
-        .doc-meta {{
-            font-size: 9pt;
-            color: #64748b;
-        }}
+        .doc-title {{ font-size: 20pt; font-weight: 800; color: #0f172a; margin: 0 0 4px 0; }}
+        .doc-meta {{ font-size: 9pt; color: #64748b; }}
         p {{ margin: 0 0 12px 0; }}
     </style>
 </head>
 <body>
     <div class="header-box">
         <div class="doc-title">{html.escape(doc.title)}</div>
-        <div class="doc-meta">Gerado pelo Caderno Interativo ANote</div>
+        <div class="doc-meta">Categoria: {html.escape(doc.category)} • ANote</div>
     </div>
-    <div class="main-content">
-        {content}
-    </div>
+    <div class="main-content">{content}</div>
     {glossary_section}
 </body>
 </html>"""
@@ -277,15 +320,16 @@ class NotebookService:
 
         terms = self.list_terms_for_document(doc_id)
         return {
-            "version": "1.1",
+            "version": "1.2",
             "title": doc.title,
+            "category": doc.category,
             "content": doc.content,
             "terms": [
                 {
                     "term_text": t.term_text,
                     "anchor_key": t.anchor_key,
                     "note_content": t.note_content,
-                    "color": getattr(t, 'color', '#89b4fa')
+                    "color": getattr(t, 'color', '#ffe066')
                 }
                 for t in terms
             ]
@@ -297,6 +341,7 @@ class NotebookService:
 
         content = data["content"]
         raw_terms = data.get("terms", [])
+        category = data.get("category", "Geral")
         remapped_terms = []
 
         for t in raw_terms:
@@ -304,7 +349,7 @@ class NotebookService:
             new_anchor = f"anc_{uuid.uuid4().hex[:8]}"
             term_text = t.get("term_text", "")
             note_content = t.get("note_content", "")
-            color = t.get("color", "#89b4fa")
+            color = t.get("color", "#ffe066")
 
             if old_anchor:
                 content = re.sub(rf'href=["\']anchor:{re.escape(old_anchor)}["\']', f'href="anchor:{new_anchor}"', content)
@@ -312,8 +357,7 @@ class NotebookService:
 
             remapped_terms.append((term_text, new_anchor, note_content, color))
 
-        new_doc = self.create_document(data["title"], content)
-
+        new_doc = self.create_document(data["title"], content, category)
         for term_text, new_anchor, note_content, color in remapped_terms:
             self.add_term_note(new_doc.id, term_text, new_anchor, note_content, color)
 
@@ -325,19 +369,16 @@ class NotebookService:
             return None
 
         terms = self.list_terms_for_document(doc_id)
-
         clean_text = doc.content
-        # Substitui links de termos por negrito no Markdown
         clean_text = re.sub(r'<a\s+[^>]*href=["\']anchor:[^"\']+["\'][^>]*>(.*?)</a>', r'**\1**', clean_text)
         clean_text = re.sub(r'</p>', '\n\n', clean_text)
         clean_text = re.sub(r'<br\s*/?>', '\n', clean_text)
         clean_text = re.sub(r'<[^>]+>', '', clean_text)
-        # Desescapa entidades HTML (&nbsp;, &amp;, etc)
-        clean_text = html.unescape(clean_text)
-        clean_text = clean_text.replace('\xa0', ' ').strip()
+        clean_text = html.unescape(clean_text).replace('\xa0', ' ').strip()
 
         md_lines = [
             f"# {doc.title}\n",
+            f"*Categoria: {doc.category}*\n\n",
             clean_text,
             "\n\n---\n",
             "## 📌 Glossário e Notas de Estudo\n"
