@@ -23,15 +23,15 @@ def run_build():
     clean_previous_builds()
 
     entry_point = ROOT_DIR / "main.py"
-    app_name = "CadernoInterativo"
+    app_name = "ANote"  # <-- GERA ANote.exe
 
-    # Mapeia a pasta de temas para entrar no executável
-    # No Windows o separador do PyInstaller é ';'
     assets_src = ROOT_DIR / "src" / "ui" / "assets"
     add_data_flag = f"{assets_src}{os.pathsep}src/ui/assets"
+    icon_file = assets_src / "icon.ico"
 
-    # Comando do PyInstaller estruturado
-    icon_file = ROOT_DIR / "src" / "ui" / "assets" / "icon.ico"
+    spec_file = ROOT_DIR / "ANote.spec"
+    if spec_file.exists():
+        spec_file.unlink()
     
     cmd = [
         sys.executable, "-m", "PyInstaller",

@@ -1,6 +1,6 @@
-# Caderno Interativo Offline
+# ANote - Caderno Interativo Offline
 
-Aplicação desktop leve, rápida e 100% offline para estudo técnico, leitura estruturada e anotações, construída em Python com interface PySide6 (Qt) e persistência em banco relacional SQLite.
+Aplicação desktop leve, rápida e 100% offline para estudo técnico, leitura estruturada e anotações contextuais, construída em Python com interface PySide6 (Qt) e persistência em banco relacional SQLite.
 
 ---
 

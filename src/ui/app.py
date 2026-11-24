@@ -1,6 +1,7 @@
-from PySide6.QtGui import QTextCursor, QTextCharFormat, QFont, QColor, QKeySequence, QShortcut, QIcon
 import sys
 import uuid
+import json
+import re
 import ctypes
 from ctypes import c_int, sizeof
 from pathlib import Path
@@ -12,10 +13,13 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QMessageBox, QStackedWidget,
     QInputDialog, QSpinBox, QColorDialog, QMenu, QDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QKeySequenceEdit,
-    QFrame
+    QFrame, QFileDialog
 )
-from PySide6.QtCore import Qt, QUrl, QPoint, QObject, QEvent
-from PySide6.QtGui import QTextCursor, QTextCharFormat, QFont, QColor, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QUrl, QPoint, QObject, QEvent, QMarginsF
+from PySide6.QtGui import (
+    QTextCursor, QTextCharFormat, QFont, QColor, QKeySequence, 
+    QShortcut, QIcon, QTextDocument, QPdfWriter, QPageSize, QPageLayout
+)
 
 from src.core.services import NotebookService
 from src.core.parser import TextParser
@@ -27,6 +31,8 @@ DEFAULT_SHORTCUTS = {
     "toggle_mode": ("Ctrl+E", "Alternar Leitura / Edição"),
     "mark_term": ("Ctrl+M", "Marcar Termo Selecionado"),
     "new_doc": ("Ctrl+N", "Criar Novo Documento"),
+    "import_doc": ("Ctrl+O", "Importar Caderno (.json)"),
+    "export_doc": ("Ctrl+Shift+S", "Exportar Documento (PDF/JSON/MD)"),
     "focus_search": ("Ctrl+F", "Focar na Barra de Pesquisa"),
     "bold": ("Ctrl+B", "Aplicar Negrito"),
     "italic": ("Ctrl+I", "Aplicar Itálico"),
@@ -35,7 +41,7 @@ DEFAULT_SHORTCUTS = {
     "toggle_right": ("Ctrl+2", "Recolher / Mostrar Painel Direito"),
 }
 
-# Utilitário Nativo: Barra de Título Escura no Windows 10/11
+# Utilitário Nativo: Barra de Título Escura no Windows
 def apply_windows_dark_titlebar(widget: QWidget, dark: bool = True):
     if sys.platform != "win32":
         return
@@ -62,14 +68,14 @@ class WindowThemeFilter(QObject):
 
 
 # =========================================================================
-# Janela Modal: Configurações de Atalhos (Com Coluna Limpar Espaçosa)
+# Janela Modal: Configurações de Atalhos
 # =========================================================================
 class SettingsDialog(QDialog):
     def __init__(self, service: NotebookService, parent=None):
         super().__init__(parent)
         self.service = service
         self.setWindowTitle("Configurações - Atalhos de Teclado")
-        self.resize(600, 520)
+        self.resize(620, 560)
         self.editor_widgets: Dict[str, QKeySequenceEdit] = {}
 
         layout = QVBoxLayout(self)
@@ -77,21 +83,20 @@ class SettingsDialog(QDialog):
 
         lbl_info = QLabel(
             "<b>Personalize os atalhos do teclado:</b><br>"
-            "<small style='color: #89b4fa;'>Clique no campo desejado e pressione a combinação de teclas. "
-            "Para desativar uma tecla de atalho, clique em 'Limpar'.</small>"
+            "<small style='color: #89b4fa;'>Pressione as teclas no campo desejado. "
+            "Para desativar um atalho, clique em 'Limpar'.</small>"
         )
         lbl_info.setWordWrap(True)
         layout.addWidget(lbl_info)
 
-        # 3 Colunas: Ação, Atalho e Botão Limpar
         self.table = QTableWidget()
         self.table.setColumnCount(3)
         self.table.setHorizontalHeaderLabels(["Ação", "Atalho Personalizado", ""])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(1, 160)
-        self.table.setColumnWidth(2, 95)  # Largura com folga total para o botão "Limpar"
+        self.table.setColumnWidth(1, 170)
+        self.table.setColumnWidth(2, 95)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(40)
         layout.addWidget(self.table)
@@ -114,19 +119,16 @@ class SettingsDialog(QDialog):
     def _populate_table(self):
         self.table.setRowCount(len(DEFAULT_SHORTCUTS))
         for row, (action_key, (default_seq, description)) in enumerate(DEFAULT_SHORTCUTS.items()):
-            # Coluna 1: Nome da Ação
             item_desc = QTableWidgetItem(f"  {description}")
             item_desc.setFlags(Qt.ItemFlag.ItemIsEnabled)
             self.table.setItem(row, 0, item_desc)
 
-            # Coluna 2: Tecla de Atalho
             current_seq = self.service.get_setting(f"shortcut_{action_key}", default_seq)
             key_edit = QKeySequenceEdit(QKeySequence(current_seq))
             key_edit.setFixedHeight(30)
             self.editor_widgets[action_key] = key_edit
             self.table.setCellWidget(row, 1, key_edit)
 
-            # Coluna 3: Botão Limpar com largura adequada
             btn_clear = QPushButton("Limpar")
             btn_clear.setFixedHeight(28)
             btn_clear.clicked.connect(lambda _, ke=key_edit: ke.clear())
@@ -143,13 +145,14 @@ class SettingsDialog(QDialog):
             self.service.set_setting(f"shortcut_{action_key}", seq_text)
         self.accept()
 
+
 # =========================================================================
-# Janela Principal com Barra Compacta e Painéis Retráteis
+# Janela Principal
 # =========================================================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Caderno Interativo Offline")
+        self.setWindowTitle("ANote")
         self.resize(1280, 780)
 
         self.service = NotebookService()
@@ -183,7 +186,7 @@ class MainWindow(QMainWindow):
         line = QFrame()
         line.setFrameShape(QFrame.Shape.VLine)
         line.setFrameShadow(QFrame.Shadow.Sunken)
-        line.setFixedHeight(24)  # Impede que o separador estique a barra
+        line.setFixedHeight(24)
         line.setStyleSheet("color: #45475a; margin: 0 4px;")
         return line
 
@@ -204,6 +207,8 @@ class MainWindow(QMainWindow):
             "toggle_mode": self._toggle_mode,
             "mark_term": self._mark_selected_term,
             "new_doc": self._create_new_document,
+            "import_doc": self._import_document,
+            "export_doc": self._export_current_document,
             "focus_search": self.input_search.setFocus,
             "bold": self._format_bold,
             "italic": self._format_italic,
@@ -232,27 +237,26 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(6, 4, 6, 6)
         main_layout.setSpacing(6)
 
-        # 1. Componentes de Texto
+        # 1. Componentes Centrais
         self.reader = QTextBrowser()
         self.reader.setOpenLinks(False)
         self.reader.anchorClicked.connect(self._on_anchor_clicked)
 
         self.editor = QTextEdit()
+        # Detecta quando o cursor se posiciona sobre um termo marcado no modo de edição
+        self.editor.cursorPositionChanged.connect(self._on_editor_cursor_moved)
 
         self.stack_center = QStackedWidget()
         self.stack_center.addWidget(self.reader)
         self.stack_center.addWidget(self.editor)
 
-        # =========================================================
-        # 2. BARRA SUPERIOR COMPACTA (ALTURA FIXA DE 46px)
-        # =========================================================
+        # 2. Barra Superior Unificada (46px)
         top_toolbar = QWidget()
-        top_toolbar.setFixedHeight(46)  # <-- CORREÇÃO DA PROPORÇÃO
+        top_toolbar.setFixedHeight(46)
         layout_toolbar = QHBoxLayout(top_toolbar)
         layout_toolbar.setContentsMargins(4, 2, 4, 2)
         layout_toolbar.setSpacing(5)
 
-        # Botão para recolher/mostrar barra esquerda
         self.btn_toggle_left = QPushButton("◧ Cadernos")
         self.btn_toggle_left.clicked.connect(self._toggle_left_panel)
         layout_toolbar.addWidget(self.btn_toggle_left)
@@ -266,6 +270,14 @@ class MainWindow(QMainWindow):
         self.btn_save = QPushButton("💾 Salvar")
         self.btn_save.clicked.connect(self._save_current_document)
         layout_toolbar.addWidget(self.btn_save)
+
+        self.btn_import = QPushButton("📥 Importar")
+        self.btn_import.clicked.connect(self._import_document)
+        layout_toolbar.addWidget(self.btn_import)
+
+        self.btn_export = QPushButton("📤 Exportar")
+        self.btn_export.clicked.connect(self._export_current_document)
+        layout_toolbar.addWidget(self.btn_export)
 
         layout_toolbar.addWidget(self._create_separator())
 
@@ -334,21 +346,17 @@ class MainWindow(QMainWindow):
 
         layout_toolbar.addWidget(self._create_separator())
 
-        # Botão para recolher/mostrar barra direita
         self.btn_toggle_right = QPushButton("◨ Notas")
         self.btn_toggle_right.clicked.connect(self._toggle_right_panel)
         layout_toolbar.addWidget(self.btn_toggle_right)
 
-        # Adiciona barra sem esticar (stretch = 0)
         main_layout.addWidget(top_toolbar, 0)
 
-        # =========================================================
-        # 3. ÁREA DE TRABALHO (OCUPA 100% DA ALTURA RESTANTE)
-        # =========================================================
+        # 3. Área de Trabalho Dividida
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(self.splitter, 1)  # <-- stretch = 1
+        main_layout.addWidget(self.splitter, 1)
 
-        # Painel Esquerdo: Lista de Documentos & Busca
+        # Painel Esquerdo: Lista de Documentos
         self.col_docs = QWidget()
         layout_docs = QVBoxLayout(self.col_docs)
         layout_docs.setContentsMargins(2, 2, 2, 2)
@@ -367,7 +375,7 @@ class MainWindow(QMainWindow):
 
         self.splitter.addWidget(self.col_docs)
 
-        # Painel Central: Folha de Leitura e Edição
+        # Painel Central: Folha de Conteúdo
         self.col_center = QWidget()
         layout_center = QVBoxLayout(self.col_center)
         layout_center.setContentsMargins(2, 2, 2, 2)
@@ -380,7 +388,7 @@ class MainWindow(QMainWindow):
         layout_center.addWidget(self.stack_center)
         self.splitter.addWidget(self.col_center)
 
-        # Painel Direito: Anotações de Contexto
+        # Painel Direito: Anotações de Contexto e Customização do Termo
         self.col_side = QWidget()
         layout_side = QVBoxLayout(self.col_side)
         layout_side.setContentsMargins(2, 2, 2, 2)
@@ -390,6 +398,12 @@ class MainWindow(QMainWindow):
         self.lbl_term_title.setWordWrap(True)
         self.lbl_term_title.setStyleSheet("font-weight: bold; font-size: 14px; color: #89b4fa;")
         layout_side.addWidget(self.lbl_term_title)
+
+        # Botão para alterar a cor da marcação sem remarcar o termo
+        self.btn_change_term_color = QPushButton("🎨 Alterar Cor da Marcação")
+        self.btn_change_term_color.setEnabled(False)
+        self.btn_change_term_color.clicked.connect(self._change_active_term_color)
+        layout_side.addWidget(self.btn_change_term_color)
 
         self.txt_term_note = QTextEdit()
         self.txt_term_note.setPlaceholderText("A nota do termo aparecerá aqui ao clicar...")
@@ -402,33 +416,24 @@ class MainWindow(QMainWindow):
 
         self.splitter.addWidget(self.col_side)
 
-        # Permite recolher as laterais arrastando, mas protege o centro
         self.splitter.setCollapsible(0, True)
         self.splitter.setCollapsible(1, False)
         self.splitter.setCollapsible(2, True)
         self.splitter.setSizes([240, 740, 280])
 
-    # ==========================================
-    # Recolher / Expandir Barras Laterais
-    # ==========================================
-
     def _toggle_left_panel(self):
-        is_visible = self.col_docs.isVisible()
-        self.col_docs.setVisible(not is_visible)
+        self.col_docs.setVisible(not self.col_docs.isVisible())
 
     def _toggle_right_panel(self):
-        is_visible = self.col_side.isVisible()
-        self.col_side.setVisible(not is_visible)
-
-    # ==========================================
-    # Tooltips Informativas (Tips)
-    # ==========================================
+        self.col_side.setVisible(not self.col_side.isVisible())
 
     def _update_all_tooltips(self):
         k_save = self._get_shortcut("save_doc") or "Sem atalho"
         k_toggle = self._get_shortcut("toggle_mode") or "Sem atalho"
         k_mark = self._get_shortcut("mark_term") or "Sem atalho"
         k_new = self._get_shortcut("new_doc") or "Sem atalho"
+        k_import = self._get_shortcut("import_doc") or "Sem atalho"
+        k_export = self._get_shortcut("export_doc") or "Sem atalho"
         k_search = self._get_shortcut("focus_search") or "Sem atalho"
         k_undo = self._get_shortcut("undo") or "Sem atalho"
         k_redo = self._get_shortcut("redo") or "Sem atalho"
@@ -439,28 +444,188 @@ class MainWindow(QMainWindow):
         k_right = self._get_shortcut("toggle_right") or "Sem atalho"
 
         self.btn_toggle_left.setToolTip(f"<b>Painel Esquerdo:</b> Mostra ou recolhe a lista de cadernos.<br><i>Atalho: {k_left}</i>")
-        self.btn_toggle_right.setToolTip(f"<b>Painel Direito:</b> Mostra ou recolhe o painel de anotações.<br><i>Atalho: {k_right}</i>")
-
+        self.btn_toggle_right.setToolTip(f"<b>Painel Direito:</b> Mostra ou recolhe o painel de notas.<br><i>Atalho: {k_right}</i>")
         self.btn_new_doc.setToolTip(f"<b>Novo Caderno:</b> Cria uma nova página de estudo.<br><i>Atalho: {k_new}</i>")
         self.btn_save.setToolTip(f"<b>Salvar:</b> Grava as alterações do texto no banco SQLite.<br><i>Atalho: {k_save}</i>")
+        self.btn_import.setToolTip(f"<b>Importar:</b> Carrega um arquivo de caderno (.json).<br><i>Atalho: {k_import}</i>")
+        self.btn_export.setToolTip(f"<b>Exportar:</b> Salva em PDF paginado, Markdown ou JSON.<br><i>Atalho: {k_export}</i>")
         self.btn_undo.setToolTip(f"<b>Desfazer:</b> Reverte a última ação de texto.<br><i>Atalho: {k_undo}</i>")
         self.btn_redo.setToolTip(f"<b>Refazer:</b> Reaplica a última ação desfeita.<br><i>Atalho: {k_redo}</i>")
         self.btn_toggle_mode.setToolTip(f"<b>Alternar Modo:</b> Alterna entre Leitura Interativa e Edição Rica.<br><i>Atalho: {k_toggle}</i>")
         self.btn_mark_term.setToolTip(f"<b>Marcar Termo:</b> Associa uma anotação lateral ao trecho selecionado.<br><i>Atalho: {k_mark}</i>")
-
+        self.btn_change_term_color.setToolTip("<b>Alterar Cor:</b> Muda a cor de destaque do termo selecionado sem precisar remarcar.")
         self.btn_bold.setToolTip(f"<b>Negrito:</b> Aplica negrito ao texto selecionado.<br><i>Atalho: {k_bold}</i>")
         self.btn_italic.setToolTip(f"<b>Itálico:</b> Aplica itálico ao texto selecionado.<br><i>Atalho: {k_italic}</i>")
         self.btn_underline.setToolTip(f"<b>Sublinhado:</b> Sublinha o texto selecionado.<br><i>Atalho: {k_und}</i>")
         self.spin_font_size.setToolTip("<b>Tamanho da Fonte:</b> Modifica o tamanho do texto da folha ou seleção.")
         self.btn_color_selection.setToolTip("<b>Cor do Texto:</b> Aplica uma cor específica na seleção de texto.")
-
         self.input_search.setToolTip(f"<b>Pesquisar:</b> Filtra cadernos pelo título em tempo real.<br><i>Atalho: {k_search}</i>")
-        self.list_docs.setToolTip("<b>Navegador:</b> Clique para abrir. Use o botão direito para Renomear, Duplicar ou Excluir.")
+        self.list_docs.setToolTip("<b>Navegador:</b> Clique para abrir. Use o botão direito para Renomear, Duplicar, Exportar ou Excluir.")
         self.btn_theme.setToolTip("<b>Tema:</b> Alterna entre Modo Escuro e Modo Claro.")
         self.btn_settings.setToolTip("<b>Configurações:</b> Personalize os atalhos de teclado do aplicativo.")
 
     # ==========================================
-    # Lógica de Controle
+    # Edição Dinâmica de Termos (Modo Leitura e Edição)
+    # ==========================================
+
+    def _on_editor_cursor_moved(self):
+        """Detecta quando o cursor no editor toca em um termo marcado e ativa o painel lateral."""
+        if self.stack_center.currentIndex() != 1:
+            return
+
+        cursor = self.editor.textCursor()
+        fmt = cursor.charFormat()
+        href = fmt.anchorHref()
+
+        if href and href.startswith("anchor:"):
+            anchor_key = href.replace("anchor:", "")
+            self._load_active_term(anchor_key)
+
+    def _load_active_term(self, anchor_key: str):
+        term = self.service.get_note_by_anchor(anchor_key)
+        if term:
+            if not self.col_side.isVisible():
+                self.col_side.setVisible(True)
+
+            self.current_anchor_key = term.anchor_key
+            self.lbl_term_title.setText(f"Termo: {term.term_text}")
+            self.txt_term_note.setPlainText(term.note_content)
+            self.btn_save_note.setEnabled(True)
+            self.btn_change_term_color.setEnabled(True)
+
+    def _change_active_term_color(self):
+        """Altera a cor do termo ativo diretamente no banco e atualiza o texto na hora."""
+        if not self.current_anchor_key:
+            return
+
+        term = self.service.get_note_by_anchor(self.current_anchor_key)
+        if not term:
+            return
+
+        color = QColorDialog.getColor(title=f"Escolha a nova cor para: {term.term_text}")
+        if color.isValid():
+            new_color = color.name()
+            # 1. Atualiza no banco
+            self.service.update_term_color(self.current_anchor_key, new_color)
+
+            # 2. Atualiza no editor e no leitor em tempo real
+            self._refresh_views()
+            doc = self.service.get_document(self.current_document_id)
+            if doc:
+                terms = self.service.list_terms_for_document(self.current_document_id)
+                colors = {t.anchor_key: (getattr(t, 'color', None) or '#89b4fa') for t in terms}
+                clean_content = TextParser.clean_legacy_tokens(doc.content, colors)
+                self.editor.setHtml(clean_content)
+
+            QMessageBox.information(self, "Sucesso", f"Cor do termo '{term.term_text}' atualizada!")
+
+    # ==========================================
+    # Funções de Importação e Exportação (PDF / JSON / MD)
+    # ==========================================
+
+    def _import_document(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Importar Caderno", "", "Caderno Interativo (*.json)"
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            new_doc = self.service.import_document_data(data)
+            if new_doc:
+                self._load_documents()
+                self._select_document_by_id(new_doc.id)
+                QMessageBox.information(self, "Sucesso", f"Caderno '{new_doc.title}' importado com sucesso!")
+            else:
+                QMessageBox.warning(self, "Erro", "Arquivo inválido ou corrompido.")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Falha ao importar caderno:\n{e}")
+
+    def _export_current_document(self):
+        if not self.current_document_id:
+            QMessageBox.warning(self, "Aviso", "Selecione um documento para exportar.")
+            return
+
+        menu = QMenu(self)
+        action_pdf = menu.addAction("📄 Documento Formatado em PDF (.pdf)")
+        action_json = menu.addAction("📦 Pacote Completo do Caderno (.json)")
+        action_md = menu.addAction("📝 Documento Markdown com Glossário (.md)")
+
+        selected = menu.exec(self.btn_export.mapToGlobal(QPoint(0, self.btn_export.height())))
+        if selected == action_pdf:
+            self._export_document_pdf(self.current_document_id)
+        elif selected == action_json:
+            self._export_document_json(self.current_document_id)
+        elif selected == action_md:
+            self._export_document_md(self.current_document_id)
+
+    def _export_document_pdf(self, doc_id: str):
+        doc = self.service.get_document(doc_id)
+        if not doc:
+            return
+
+        safe_title = "".join(c for c in doc.title if c.isalnum() or c in (' ', '_', '-')).strip() or "documento"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar para PDF", f"{safe_title}.pdf", "Documento PDF (*.pdf)"
+        )
+        if not file_path:
+            return
+
+        try:
+            printable_html = self.service.export_to_printable_html(doc_id)
+            if not printable_html:
+                return
+
+            # Configura o gravador de PDF com margens proporcionadas de A4
+            writer = QPdfWriter(file_path)
+            writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+            writer.setResolution(96)  # Resolução padrão de renderização tipográfica do Qt
+            writer.setPageMargins(QMarginsF(18, 18, 18, 18), QPageLayout.Unit.Millimeter)
+
+            pdf_doc = QTextDocument()
+            # Ajusta a largura do documento para casar com a área útil da página A4
+            page_rect = writer.pageLayout().paintRectPixels(writer.resolution())
+            pdf_doc.setTextWidth(page_rect.width())
+            pdf_doc.setHtml(printable_html)
+
+            pdf_doc.print_(writer)
+            QMessageBox.information(self, "Sucesso", "Documento PDF gerado com sucesso!")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Falha ao exportar PDF:\n{e}")
+
+    def _export_document_json(self, doc_id: str):
+        doc = self.service.get_document(doc_id)
+        if not doc:
+            return
+        safe_title = "".join(c for c in doc.title if c.isalnum() or c in (' ', '_', '-')).strip() or "caderno"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar Caderno", f"{safe_title}.json", "Caderno Interativo (*.json)"
+        )
+        if file_path:
+            data = self.service.export_document_data(doc_id)
+            if data:
+                Path(file_path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+                QMessageBox.information(self, "Sucesso", "Pacote do caderno exportado com sucesso!")
+
+    def _export_document_md(self, doc_id: str):
+        doc = self.service.get_document(doc_id)
+        if not doc:
+            return
+        safe_title = "".join(c for c in doc.title if c.isalnum() or c in (' ', '_', '-')).strip() or "caderno"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar Markdown", f"{safe_title}.md", "Markdown (*.md)"
+        )
+        if file_path:
+            content = self.service.export_to_markdown(doc_id)
+            if content:
+                Path(file_path).write_text(content, encoding="utf-8")
+                QMessageBox.information(self, "Sucesso", "Documento Markdown exportado com sucesso!")
+
+    # ==========================================
+    # Lógica Geral e Controle
     # ==========================================
 
     def _open_settings_dialog(self):
@@ -545,25 +710,32 @@ class MainWindow(QMainWindow):
         action_rename = menu.addAction("✏️ Renomear")
         action_duplicate = menu.addAction("📄 Duplicar / Criar Cópia")
         menu.addSeparator()
+        action_export_pdf = menu.addAction("📄 Exportar para PDF (.pdf)")
+        action_export_json = menu.addAction("📦 Exportar Caderno (.json)")
+        action_export_md = menu.addAction("📝 Exportar como Markdown (.md)")
+        menu.addSeparator()
         action_delete = menu.addAction("🗑️ Excluir Documento")
 
-        selected_action = menu.exec(self.list_docs.mapToGlobal(position))
-
-        if selected_action == action_rename:
+        selected = menu.exec(self.list_docs.mapToGlobal(position))
+        if selected == action_rename:
             new_title, ok = QInputDialog.getText(self, "Renomear Documento", "Novo título:", text=doc_title)
             if ok and new_title.strip() and new_title.strip() != doc_title:
                 self.service.rename_document(doc_id, new_title.strip())
                 item.setText(new_title.strip())
                 if self.current_document_id == doc_id:
                     self.input_doc_title.setText(new_title.strip())
-
-        elif selected_action == action_duplicate:
+        elif selected == action_duplicate:
             new_doc = self.service.duplicate_document(doc_id)
             if new_doc:
                 self._load_documents()
                 self._select_document_by_id(new_doc.id)
-
-        elif selected_action == action_delete:
+        elif selected == action_export_pdf:
+            self._export_document_pdf(doc_id)
+        elif selected == action_export_json:
+            self._export_document_json(doc_id)
+        elif selected == action_export_md:
+            self._export_document_md(doc_id)
+        elif selected == action_delete:
             confirm = QMessageBox.question(
                 self,
                 "Confirmar Exclusão",
@@ -636,6 +808,7 @@ class MainWindow(QMainWindow):
             self.lbl_term_title.setText("<i>Nenhum documento aberto</i>")
             self.txt_term_note.clear()
             self.btn_save_note.setEnabled(False)
+            self.btn_change_term_color.setEnabled(False)
 
     def _create_new_document(self):
         title, ok = QInputDialog.getText(self, "Novo Documento", "Título do documento:")
@@ -666,6 +839,7 @@ class MainWindow(QMainWindow):
         self.lbl_term_title.setText("<i>Selecione um termo grifado</i>")
         self.txt_term_note.clear()
         self.btn_save_note.setEnabled(False)
+        self.btn_change_term_color.setEnabled(False)
 
     def _toggle_mode(self):
         if not self.current_document_id:
@@ -725,6 +899,8 @@ class MainWindow(QMainWindow):
             )
             cursor.insertHtml(html_link)
 
+            # Ativa imediatamente o termo no painel lateral
+            self._load_active_term(anchor_key)
             QMessageBox.information(self, "Sucesso", f"Termo '{selected_text}' marcado com sucesso!")
 
     def _on_anchor_clicked(self, url: QUrl):
@@ -733,17 +909,7 @@ class MainWindow(QMainWindow):
             return
 
         anchor_key = url_str.replace("anchor:", "")
-        term = self.service.get_note_by_anchor(anchor_key)
-
-        if term:
-            # Se o painel direito estiver recolhido, abre automaticamente ao clicar no termo
-            if not self.col_side.isVisible():
-                self.col_side.setVisible(True)
-
-            self.current_anchor_key = term.anchor_key
-            self.lbl_term_title.setText(f"Termo: {term.term_text}")
-            self.txt_term_note.setPlainText(term.note_content)
-            self.btn_save_note.setEnabled(True)
+        self._load_active_term(anchor_key)
 
     def _save_note_changes(self):
         if not self.current_anchor_key:
@@ -755,17 +921,15 @@ class MainWindow(QMainWindow):
 
 
 def run_app():
-    # Corrige a barra de tarefas do Windows para mostrar o ícone próprio em vez do Python padrão
     if sys.platform == "win32":
         try:
-            myappid = "caderno.interativo.offline.1.0"
+            myappid = "anote.desktop.app.1.0"
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except Exception:
             pass
 
     app = QApplication(sys.argv)
 
-    # Define o ícone global da aplicação
     icon_path = Path(__file__).resolve().parent / "assets" / "icon.png"
     if icon_path.exists():
         app_icon = QIcon(str(icon_path))
