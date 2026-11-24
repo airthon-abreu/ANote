@@ -31,13 +31,16 @@ def run_build():
     add_data_flag = f"{assets_src}{os.pathsep}src/ui/assets"
 
     # Comando do PyInstaller estruturado
+    icon_file = ROOT_DIR / "src" / "ui" / "assets" / "icon.ico"
+    
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--noconsole",                  # Oculta a janela preta do prompt
-        "--onefile",                    # Gera um único executável portátil
-        f"--name={app_name}",           # Nome final
-        "--clean",                      # Limpa cache do compilador
-        f"--add-data={add_data_flag}",  # EMBUTE OS ARQUIVOS .QSS DENTRO DO .EXE
+        "--noconsole",
+        "--onefile",
+        f"--name={app_name}",
+        "--clean",
+        f"--add-data={add_data_flag}",
+        f"--icon={icon_file}",          # <-- DEFINE O ÍCONE DO .EXE NO WINDOWS
         str(entry_point)
     ]
 

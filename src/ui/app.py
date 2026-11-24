@@ -1,3 +1,4 @@
+from PySide6.QtGui import QTextCursor, QTextCharFormat, QFont, QColor, QKeySequence, QShortcut, QIcon
 import sys
 import uuid
 import ctypes
@@ -754,9 +755,28 @@ class MainWindow(QMainWindow):
 
 
 def run_app():
+    # Corrige a barra de tarefas do Windows para mostrar o ícone próprio em vez do Python padrão
+    if sys.platform == "win32":
+        try:
+            myappid = "caderno.interativo.offline.1.0"
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+
+    # Define o ícone global da aplicação
+    icon_path = Path(__file__).resolve().parent / "assets" / "icon.png"
+    if icon_path.exists():
+        app_icon = QIcon(str(icon_path))
+        app.setWindowIcon(app_icon)
+
     window = MainWindow()
+    if icon_path.exists():
+        window.setWindowIcon(QIcon(str(icon_path)))
+
     theme_filter = WindowThemeFilter(window)
     app.installEventFilter(theme_filter)
+
     window.show()
     sys.exit(app.exec())
