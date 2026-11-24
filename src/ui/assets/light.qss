@@ -55,3 +55,21 @@ QPushButton:disabled {
     color: #8c959f;
     border-color: #d0d7de;
 }
+
+/* Cabeçalho e Tabela em Alto Contraste */
+QHeaderView::section {
+    background-color: #eaeef2;
+    color: #0969da;
+    padding: 8px;
+    border: 1px solid #d0d7de;
+    font-weight: bold;
+    font-size: 13px;
+}
+
+QTableWidget {
+    background-color: #ffffff;
+    border: 1px solid #d0d7de;
+    gridline-color: #d0d7de;
+    border-radius: 8px;
+    outline: none;
+}

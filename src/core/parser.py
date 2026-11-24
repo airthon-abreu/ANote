@@ -6,15 +6,17 @@ ANCHOR_REGEX = re.compile(r"\[\[(.*?)\|(.*?)\]\]")
 
 class TextParser:
     @staticmethod
-    def to_html(
-        raw_content: str,
-        term_colors: Optional[Dict[str, str]] = None,
-        font_size: int = 15,
-        text_color: str = "#cdd6f4",
-        bg_color: str = "#181825"
-    ) -> str:
+    def clean_legacy_tokens(raw_content: str, term_colors: Optional[Dict[str, str]] = None) -> str:
+        """
+        Converte documentos antigos com [[termo|ancora]] para HTML rico nativo,
+        escondendo os códigos para sempre.
+        """
         if not raw_content:
             return ""
+
+        # Se já for HTML moderno, retorna direto
+        if "<p" in raw_content or "<span" in raw_content or "<html" in raw_content:
+            return raw_content
 
         term_colors = term_colors or {}
         paragraphs = raw_content.split("\n")
@@ -32,8 +34,13 @@ class TextParser:
         for p in paragraphs:
             escaped = html.escape(p)
             formatted = ANCHOR_REGEX.sub(replace_anchor, escaped)
-            html_paragraphs.append(f"<p style='margin: 6px 0; line-height: 1.6;'>{formatted}</p>")
+            html_paragraphs.append(f"<p style='margin: 4px 0;'>{formatted}</p>")
 
+        return "".join(html_paragraphs)
+
+    @staticmethod
+    def wrap_in_page_style(html_body: str, font_size: int = 15, text_color: str = "#cdd6f4", bg_color: str = "#181825") -> str:
+        """Envelopa o HTML com o tema e fontes do leitor."""
         return f"""
         <html>
         <head>
@@ -43,16 +50,12 @@ class TextParser:
                     font-size: {font_size}px;
                     color: {text_color};
                     background-color: {bg_color};
+                    line-height: 1.6;
                 }}
             </style>
         </head>
         <body>
-            {''.join(html_paragraphs)}
+            {html_body}
         </body>
         </html>
         """
-
-    @staticmethod
-    def inject_anchor(raw_content: str, selected_text: str, anchor_key: str) -> str:
-        target = f"[[{selected_text}|{anchor_key}]]"
-        return raw_content.replace(selected_text, target, 1)
