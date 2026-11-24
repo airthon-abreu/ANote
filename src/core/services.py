@@ -1,5 +1,7 @@
 import re
-from typing import List, Optional
+import uuid
+import html
+from typing import List, Optional, Dict, Any
 from src.core.storage import Database
 from src.core.models import Document, Term
 
@@ -8,115 +10,9 @@ class NotebookService:
         self.db = db or Database()
 
     # --- Operações de Documento ---
-    def update_term_color(self, anchor_key: str, new_color: str):
-        """Atualiza apenas a cor de destaque de um termo existente."""
-        with self.db.get_connection() as conn:
-            conn.execute(
-                "UPDATE terms SET color = ? WHERE anchor_key = ?",
-                (new_color, anchor_key)
-            )
-
-    def export_to_printable_html(self, doc_id: str) -> Optional[str]:
-        """Gera um layout de design editorial em A4 profissional para o PDF."""
-        doc = self.get_document(doc_id)
-        if not doc:
-            return None
-
-        terms = self.list_terms_for_document(doc_id)
-        
-        # 1. Limpa fontes em 'px' geradas pelo editor para não encolherem no PDF
-        content = doc.content
-        content = re.sub(r'font-size:\s*[^;"]+;?', '', content)
-        content = re.sub(r'color:\s*#[0-9a-fA-F]+;?', '', content)  # Deixa o texto base escuro para impressão
-
-        # 2. Converte termos para etiquetas coloridas de leitura
-        for t in terms:
-            badge = (
-                f'<span style="background-color: {t.color}; color: #111111; '
-                f'padding: 2px 6px; border-radius: 4px; font-weight: bold;">{t.term_text}</span>'
-            )
-            content = re.sub(rf'<a href="anchor:{t.anchor_key}"[^>]*>(.*?)</a>', badge, content)
-
-        # 3. Monta a tabela de notas do glossário
-        if terms:
-            glossary_rows = "".join(
-                f'''
-                <tr>
-                    <td style="width: 30%; font-weight: bold; padding: 10px; border-bottom: 1px solid #e2e8f0; vertical-align: top;">
-                        <span style="background-color: {t.color}; color: #111; padding: 2px 6px; border-radius: 4px;">{t.term_text}</span>
-                    </td>
-                    <td style="width: 70%; padding: 10px; border-bottom: 1px solid #e2e8f0; color: #334155; line-height: 1.5; vertical-align: top;">
-                        {t.note_content}
-                    </td>
-                </tr>
-                '''
-                for t in terms
-            )
-            glossary_section = f"""
-            <div style="margin-top: 45px; page-break-inside: avoid;">
-                <div style="background-color: #f1f5f9; padding: 12px 18px; border-radius: 6px; border-left: 4px solid #3b82f6; margin-bottom: 15px;">
-                    <b style="font-size: 13pt; color: #1e293b;">📌 Glossário e Anotações de Estudo</b>
-                </div>
-                <table style="width: 100%; border-collapse: collapse; font-size: 10.5pt;">
-                    {glossary_rows}
-                </table>
-            </div>
-            """
-        else:
-            glossary_section = ""
-
-        # 4. Template Completo do PDF em Folha A4
-        return f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <style>
-                body {{
-                    font-family: "Segoe UI", Arial, Helvetica, sans-serif;
-                    font-size: 11.5pt;
-                    color: #1e293b;
-                    line-height: 1.7;
-                    margin: 0;
-                    padding: 0;
-                }}
-                .header-box {{
-                    border-bottom: 2px solid #0f172a;
-                    padding-bottom: 12px;
-                    margin-bottom: 25px;
-                }}
-                .doc-title {{
-                    font-size: 22pt;
-                    font-weight: 800;
-                    color: #0f172a;
-                    margin: 0 0 6px 0;
-                }}
-                .doc-meta {{
-                    font-size: 9pt;
-                    color: #64748b;
-                }}
-                p {{
-                    margin: 0 0 14px 0;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="header-box">
-                <div class="doc-title">{doc.title}</div>
-                <div class="doc-meta">Documento gerado via Caderno Interativo Offline</div>
-            </div>
-            
-            <div class="main-content">
-                {content}
-            </div>
-
-            {glossary_section}
-        </body>
-        </html>
-        """
 
     def create_document(self, title: str, content: str) -> Document:
-        doc = Document(title=title, content=content)
+        doc = Document(title=title.strip() or "Sem título", content=content)
         with self.db.get_connection() as conn:
             conn.execute(
                 "INSERT INTO documents (id, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
@@ -135,14 +31,54 @@ class NotebookService:
             return Document(**dict(row)) if row else None
 
     def update_document(self, doc_id: str, title: str, content: str):
-        """Atualiza conteúdo e título com timestamp automático."""
         with self.db.get_connection() as conn:
             conn.execute(
                 "UPDATE documents SET title = ?, content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (title, content, doc_id)
+                (title.strip() or "Sem título", content, doc_id)
             )
 
-    # --- Operações de Termos / Notas Laterais ---
+    def rename_document(self, doc_id: str, new_title: str):
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE documents SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_title.strip() or "Sem título", doc_id)
+            )
+
+    def delete_document(self, doc_id: str):
+        with self.db.get_connection() as conn:
+            conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+
+    def duplicate_document(self, doc_id: str) -> Optional[Document]:
+        """Duplica um documento remapeando tags HTML e tokens legados para novas chaves exclusivas."""
+        original = self.get_document(doc_id)
+        if not original:
+            return None
+
+        terms = self.list_terms_for_document(doc_id)
+        new_content = original.content
+        new_terms_to_insert = []
+
+        for t in terms:
+            new_anchor = f"anc_{uuid.uuid4().hex[:8]}"
+            # Substituição precisa em links HTML
+            new_content = re.sub(
+                rf'href=["\']anchor:{re.escape(t.anchor_key)}["\']',
+                f'href="anchor:{new_anchor}"',
+                new_content
+            )
+            # Substituição para tokens legados se existirem
+            new_content = new_content.replace(f"|{t.anchor_key}]]", f"|{new_anchor}]]")
+
+            new_terms_to_insert.append((t.term_text, new_anchor, t.note_content, getattr(t, 'color', '#89b4fa')))
+
+        new_doc = self.create_document(f"{original.title} (Cópia)", new_content)
+
+        for term_text, new_anchor, note_content, color in new_terms_to_insert:
+            self.add_term_note(new_doc.id, term_text, new_anchor, note_content, color)
+
+        return new_doc
+
+    # --- Operações de Termos / Anotações ---
 
     def add_term_note(self, document_id: str, term_text: str, anchor_key: str, note_content: str, color: str = "#89b4fa") -> Term:
         term = Term(
@@ -167,18 +103,52 @@ class NotebookService:
 
     def list_terms_for_document(self, document_id: str) -> List[Term]:
         with self.db.get_connection() as conn:
-            rows = conn.execute("SELECT * FROM terms WHERE document_id = ?", (document_id,)).fetchall()
+            rows = conn.execute("SELECT * FROM terms WHERE document_id = ? ORDER BY created_at ASC", (document_id,)).fetchall()
             return [Term(**dict(row)) for row in rows]
 
     def update_term_note(self, anchor_key: str, new_note: str):
-        """Atualiza o conteúdo de uma nota existente."""
         with self.db.get_connection() as conn:
-            conn.execute(
-                "UPDATE terms SET note_content = ? WHERE anchor_key = ?",
-                (new_note, anchor_key)
-            )
+            conn.execute("UPDATE terms SET note_content = ? WHERE anchor_key = ?", (new_note, anchor_key))
 
-    # --- Configurações / Preferências de Usuário (Blindadas) ---
+    def update_term_color(self, doc_id: str, anchor_key: str, new_color: str):
+        """Atualiza a cor no banco de dados e sincroniza o estilo inline no HTML do documento."""
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE terms SET color = ? WHERE anchor_key = ?", (new_color, anchor_key))
+
+            doc_row = conn.execute("SELECT content FROM documents WHERE id = ?", (doc_id,)).fetchone()
+            if doc_row:
+                content = doc_row["content"]
+                # Substitui background-color do link específico
+                pattern = rf'(<a\s+[^>]*href=["\']anchor:{re.escape(anchor_key)}["\'][^>]*style=["\'][^"\']*background-color:\s*)(#[0-9a-fA-F]{{3,6}})'
+                if re.search(pattern, content):
+                    content = re.sub(pattern, rf'\g<1>{new_color}', content)
+                else:
+                    # Caso o estilo esteja formatado diferente
+                    replace_tag = (
+                        rf'<a href="anchor:{anchor_key}" style="background-color: {new_color}; color: #11111b; '
+                        rf'padding: 2px 6px; border-radius: 4px; text-decoration: none; font-weight: bold;"'
+                    )
+                    content = re.sub(rf'<a\s+[^>]*href=["\']anchor:{re.escape(anchor_key)}["\'][^>]*', replace_tag, content)
+
+                conn.execute("UPDATE documents SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (content, doc_id))
+
+    def delete_term(self, doc_id: str, anchor_key: str):
+        """Exclui a anotação da tabela e remove a tag âncora do HTML mantendo o texto visível."""
+        with self.db.get_connection() as conn:
+            conn.execute("DELETE FROM terms WHERE anchor_key = ?", (anchor_key,))
+            doc_row = conn.execute("SELECT content FROM documents WHERE id = ?", (doc_id,)).fetchone()
+            if doc_row:
+                content = doc_row["content"]
+                # Desembrulha a tag <a> mantendo apenas o texto interno
+                unwrapped_content = re.sub(
+                    rf'<a\s+[^>]*href=["\']anchor:{re.escape(anchor_key)}["\'][^>]*>(.*?)</a>',
+                    r'\1',
+                    content,
+                    flags=re.DOTALL
+                )
+                conn.execute("UPDATE documents SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (unwrapped_content, doc_id))
+
+    # --- Preferências do Usuário ---
 
     def get_setting(self, key: str, default: str = "") -> str:
         with self.db.get_connection() as conn:
@@ -193,7 +163,6 @@ class NotebookService:
             )
 
     def get_font_size(self, default: int = 15) -> int:
-        """Lê o tamanho da fonte com validação de tipo e limites."""
         raw = self.get_setting("font_size", str(default))
         try:
             val = int(raw)
@@ -202,43 +171,113 @@ class NotebookService:
             return default
 
     def get_theme(self, default: str = "dark") -> str:
-        """Garante que apenas temas válidos sejam retornados."""
         theme = self.get_setting("theme", default).lower()
         return theme if theme in {"dark", "light"} else default
 
     def get_text_color(self, default: str = "#cdd6f4") -> str:
-        """Valida se a cor é um formato hexadecimal válido."""
         color = self.get_setting("text_color", default)
         if re.match(r"^#(?:[0-9a-fA-F]{3}){1,2}$", color):
             return color
         return default
 
-    def rename_document(self, doc_id: str, new_title: str):
-        """Renomeia apenas o título de um documento."""
-        with self.db.get_connection() as conn:
-            conn.execute(
-                "UPDATE documents SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (new_title.strip(), doc_id)
+    # --- Exportação e Importação ---
+
+    def export_to_printable_html(self, doc_id: str) -> Optional[str]:
+        doc = self.get_document(doc_id)
+        if not doc:
+            return None
+
+        terms = self.list_terms_for_document(doc_id)
+        content = doc.content
+
+        # Limpeza de fontes com valores fixos em pixels
+        content = re.sub(r'font-size:\s*[^;"]+;?', '', content)
+        content = re.sub(r'color:\s*#[0-9a-fA-F]+;?', '', content)
+
+        for t in terms:
+            badge = (
+                f'<span style="background-color: {t.color}; color: #111111; '
+                f'padding: 2px 6px; border-radius: 4px; font-weight: bold;">{html.escape(t.term_text)}</span>'
             )
+            content = re.sub(rf'<a\s+[^>]*href=["\']anchor:{re.escape(t.anchor_key)}["\'][^>]*>(.*?)</a>', badge, content)
 
-    def delete_document(self, doc_id: str):
-        """Exclui o documento e todas as suas notas associadas (via CASCADE)."""
-        with self.db.get_connection() as conn:
-            conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+        glossary_section = ""
+        if terms:
+            glossary_rows = "".join(
+                f'''
+                <tr>
+                    <td style="width: 30%; font-weight: bold; padding: 10px; border-bottom: 1px solid #e2e8f0; vertical-align: top;">
+                        <span style="background-color: {t.color}; color: #111; padding: 2px 6px; border-radius: 4px;">{html.escape(t.term_text)}</span>
+                    </td>
+                    <td style="width: 70%; padding: 10px; border-bottom: 1px solid #e2e8f0; color: #334155; line-height: 1.5; vertical-align: top;">
+                        {html.escape(t.note_content).replace(chr(10), "<br>")}
+                    </td>
+                </tr>
+                '''
+                for t in terms
+            )
+            glossary_section = f"""
+            <div style="margin-top: 40px; page-break-inside: avoid;">
+                <div style="background-color: #f1f5f9; padding: 10px 16px; border-radius: 6px; border-left: 4px solid #3b82f6; margin-bottom: 12px;">
+                    <b style="font-size: 13pt; color: #1e293b;">📌 Glossário e Anotações de Estudo</b>
+                </div>
+                <table style="width: 100%; border-collapse: collapse; font-size: 10.5pt;">
+                    {glossary_rows}
+                </table>
+            </div>
+            """
 
-# ==========================================
-    # Exportação e Importação
-    # ==========================================
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        body {{
+            font-family: "Segoe UI", Arial, sans-serif;
+            font-size: 11.5pt;
+            color: #1e293b;
+            line-height: 1.6;
+            margin: 0;
+            padding: 0;
+        }}
+        .header-box {{
+            border-bottom: 2px solid #0f172a;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+        }}
+        .doc-title {{
+            font-size: 20pt;
+            font-weight: 800;
+            color: #0f172a;
+            margin: 0 0 4px 0;
+        }}
+        .doc-meta {{
+            font-size: 9pt;
+            color: #64748b;
+        }}
+        p {{ margin: 0 0 12px 0; }}
+    </style>
+</head>
+<body>
+    <div class="header-box">
+        <div class="doc-title">{html.escape(doc.title)}</div>
+        <div class="doc-meta">Gerado pelo Caderno Interativo ANote</div>
+    </div>
+    <div class="main-content">
+        {content}
+    </div>
+    {glossary_section}
+</body>
+</html>"""
 
     def export_document_data(self, doc_id: str) -> Optional[dict]:
-        """Gera um dicionário completo com o documento e todas as suas notas associadas."""
         doc = self.get_document(doc_id)
         if not doc:
             return None
 
         terms = self.list_terms_for_document(doc_id)
         return {
-            "version": "1.0",
+            "version": "1.1",
             "title": doc.title,
             "content": doc.content,
             "terms": [
@@ -253,15 +292,13 @@ class NotebookService:
         }
 
     def import_document_data(self, data: dict) -> Optional[Document]:
-        """Importa um documento, remapeando as âncoras para evitar conflitos de chaves únicas."""
-        if "title" not in data or "content" not in data:
+        if not isinstance(data, dict) or "title" not in data or "content" not in data:
             return None
 
         content = data["content"]
         raw_terms = data.get("terms", [])
         remapped_terms = []
 
-        # Remapeia âncoras antigas para novas chaves exclusivas
         for t in raw_terms:
             old_anchor = t.get("anchor_key", "")
             new_anchor = f"anc_{uuid.uuid4().hex[:8]}"
@@ -270,34 +307,34 @@ class NotebookService:
             color = t.get("color", "#89b4fa")
 
             if old_anchor:
-                # Substitui tanto no formato HTML quanto no formato legado
-                content = content.replace(f'anchor:{old_anchor}', f'anchor:{new_anchor}')
+                content = re.sub(rf'href=["\']anchor:{re.escape(old_anchor)}["\']', f'href="anchor:{new_anchor}"', content)
                 content = content.replace(f'|{old_anchor}]]', f'|{new_anchor}]]')
 
             remapped_terms.append((term_text, new_anchor, note_content, color))
 
-        # Cria o novo documento
         new_doc = self.create_document(data["title"], content)
 
-        # Salva os termos vinculados com as novas chaves
         for term_text, new_anchor, note_content, color in remapped_terms:
             self.add_term_note(new_doc.id, term_text, new_anchor, note_content, color)
 
         return new_doc
 
     def export_to_markdown(self, doc_id: str) -> Optional[str]:
-        """Gera um arquivo Markdown limpo com o texto e um glossário no final."""
         doc = self.get_document(doc_id)
         if not doc:
             return None
 
         terms = self.list_terms_for_document(doc_id)
 
-        # Remove tags HTML simples mantendo quebras de linha
         clean_text = doc.content
-        clean_text = re.sub(r'<a href="anchor:[^"]+"[^>]*>(.*?)</a>', r'**\1**', clean_text)
+        # Substitui links de termos por negrito no Markdown
+        clean_text = re.sub(r'<a\s+[^>]*href=["\']anchor:[^"\']+["\'][^>]*>(.*?)</a>', r'**\1**', clean_text)
         clean_text = re.sub(r'</p>', '\n\n', clean_text)
-        clean_text = re.sub(r'<[^>]+>', '', clean_text).strip()
+        clean_text = re.sub(r'<br\s*/?>', '\n', clean_text)
+        clean_text = re.sub(r'<[^>]+>', '', clean_text)
+        # Desescapa entidades HTML (&nbsp;, &amp;, etc)
+        clean_text = html.unescape(clean_text)
+        clean_text = clean_text.replace('\xa0', ' ').strip()
 
         md_lines = [
             f"# {doc.title}\n",
@@ -313,28 +350,3 @@ class NotebookService:
             md_lines.append("_Nenhum termo marcado neste documento._")
 
         return "\n".join(md_lines)
-    
-    def duplicate_document(self, doc_id: str) -> Optional[Document]:
-        """Clona um documento e recria seus termos com novas âncoras independentes."""
-        original = self.get_document(doc_id)
-        if not original:
-            return None
-
-        terms = self.list_terms_for_document(doc_id)
-        new_content = original.content
-        new_terms_to_insert = []
-
-        # Gera novas chaves para evitar conflito de UNIQUE no banco
-        for t in terms:
-            new_anchor = f"anc_{uuid.uuid4().hex[:8]}"
-            old_token = f"[[{t.term_text}|{t.anchor_key}]]"
-            new_token = f"[[{t.term_text}|{new_anchor}]]"
-            new_content = new_content.replace(old_token, new_token)
-            new_terms_to_insert.append((t.term_text, new_anchor, t.note_content, getattr(t, 'color', '#89b4fa')))
-
-        new_doc = self.create_document(f"{original.title} (Cópia)", new_content)
-
-        for term_text, new_anchor, note_content, color in new_terms_to_insert:
-            self.add_term_note(new_doc.id, term_text, new_anchor, note_content, color)
-
-        return new_doc

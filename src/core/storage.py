@@ -11,10 +11,15 @@ class Database:
 
     @contextmanager
     def get_connection(self) -> Generator[sqlite3.Connection, None, None]:
-        """Garante abertura, commit automático e fechamento seguro da conexão."""
-        conn = sqlite3.connect(self.db_path)
+        """
+        Abre conexão com timeout estendido, suporte a WAL e garantia
+        de integridade referencial com fechamento determinístico.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA synchronous = NORMAL;")
         try:
             yield conn
             conn.commit()
@@ -22,10 +27,10 @@ class Database:
             conn.rollback()
             raise
         finally:
-            conn.close()  # <-- IMPEDE O VAZAMENTO DE CONEXÕES
+            conn.close()
 
     def _init_db(self):
-        """Inicializa as tabelas caso não existam e aplica migrações de esquema."""
+        """Inicializa as tabelas com índices de busca e migração segura."""
         with self.get_connection() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS documents (
@@ -56,7 +61,7 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_terms_anchor ON terms(anchor_key);
             """)
 
-            try:
+            # Migração suave para bases legadas
+            columns = [row["name"] for row in conn.execute("PRAGMA table_info(terms);").fetchall()]
+            if "color" not in columns:
                 conn.execute("ALTER TABLE terms ADD COLUMN color TEXT DEFAULT '#89b4fa';")
-            except sqlite3.OperationalError:
-                pass
