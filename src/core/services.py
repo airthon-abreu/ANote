@@ -1,10 +1,16 @@
 import re
 import uuid
 import html
+import sqlite3
+import shutil
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional, Dict, Set
+
+from config import BASE_DIR, DB_PATH
 from src.core.storage import Database
 from src.core.models import Document, Term
+
 
 def extract_anchors_from_html(content: str) -> Set[str]:
     """Extrai todas as chaves de âncoras realmente presentes no texto."""
@@ -105,6 +111,61 @@ class NotebookService:
 
         return new_doc
 
+    # --- Backup e Restauração Atômica ---
+
+    def create_database_backup(self, custom_path: Optional[Path] = None) -> Path:
+        """
+        Cria uma cópia de segurança atômica (online) do banco SQLite sem travar o app.
+        """
+        if custom_path is None:
+            backups_dir = BASE_DIR / "backups"
+            backups_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            target_path = backups_dir / f"notebook_backup_{timestamp}.db"
+        else:
+            target_path = Path(custom_path)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        src_conn = sqlite3.connect(self.db.db_path)
+        dst_conn = sqlite3.connect(target_path)
+        try:
+            with dst_conn:
+                src_conn.backup(dst_conn)
+        finally:
+            dst_conn.close()
+            src_conn.close()
+
+        return target_path
+
+    def restore_database_backup(self, backup_file_path: Path) -> bool:
+        """
+        Valida e restaura o banco de dados a partir de um arquivo .db de backup.
+        """
+        backup_path = Path(backup_file_path)
+        if not backup_path.exists():
+            return False
+
+        test_conn = sqlite3.connect(backup_path)
+        try:
+            row = test_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='documents';").fetchone()
+            if not row:
+                return False
+        except Exception:
+            return False
+        finally:
+            test_conn.close()
+
+        src_conn = sqlite3.connect(backup_path)
+        dst_conn = sqlite3.connect(self.db.db_path)
+        try:
+            with dst_conn:
+                src_conn.backup(dst_conn)
+        finally:
+            dst_conn.close()
+            src_conn.close()
+
+        return True
+
     # --- Histórico de Modificações (Snapshots) ---
 
     def save_history_snapshot(self, doc_id: str, title: str, content: str):
@@ -137,7 +198,6 @@ class NotebookService:
     # --- Saneamento e Termos / Anotações ---
 
     def clean_orphaned_terms(self, document_id: str, content: str):
-        """Purga do banco qualquer nota cujo termo já não exista mais no texto."""
         active_anchors = extract_anchors_from_html(content)
         with self.db.get_connection() as conn:
             rows = conn.execute("SELECT anchor_key FROM terms WHERE document_id = ?", (document_id,)).fetchall()
@@ -147,7 +207,6 @@ class NotebookService:
                     conn.execute("DELETE FROM terms WHERE anchor_key = ?", (key,))
 
     def count_terms(self, document_id: str, content: Optional[str] = None) -> int:
-        """Retorna a contagem exata e real de termos marcados presentes no texto."""
         if content is not None:
             active_anchors = extract_anchors_from_html(content)
             self.clean_orphaned_terms(document_id, content)
@@ -181,7 +240,8 @@ class NotebookService:
 
     def get_note_by_anchor(self, anchor_key: str) -> Optional[Term]:
         with self.db.get_connection() as conn:
-            row = conn.execute("SELECT * FROM terms WHERE anchor_key = ?", (anchor_key,)).fetchone()
+            row = conn.execute("SELECT * FROM terms WHERE anchor_key = ?", (anchor_key,))
+            row = row.fetchone()
             return Term(**dict(row)) if row else None
 
     def list_terms_for_document(self, document_id: str) -> List[Term]:
@@ -202,7 +262,6 @@ class NotebookService:
             conn.execute("UPDATE terms SET color = ? WHERE anchor_key = ?", (new_color, anchor_key))
 
     def delete_term(self, doc_id: str, anchor_key: str):
-        """Remove o registro da nota no SQLite."""
         with self.db.get_connection() as conn:
             conn.execute("DELETE FROM terms WHERE anchor_key = ?", (anchor_key,))
 

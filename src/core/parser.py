@@ -53,25 +53,30 @@ class TextParser:
             font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Roboto", sans-serif;
             font-size: {font_size}px;
             color: {text_color};
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            word-break: break-word;
         }}
         .notebook-sheet {{
-            max-width: 820px;
+            max-width: 860px;
             margin: 0 auto;
             background-color: {sheet_bg};
             padding: 30px 42px;
             border-radius: 10px;
             border: 1px solid {border_color};
             line-height: 1.7;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            word-break: break-word;
         }}
-        p {{ margin: 0 0 12px 0; }}
+        p, div, span, pre, code {{
+            margin: 0 0 12px 0;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            word-break: break-word;
+            white-space: pre-wrap;
+        }}
         a {{ text-decoration: none; }}
-        .callout-box {{
-            background-color: {'rgba(137, 180, 250, 0.12)' if is_dark else '#f0f7ff'};
-            border-left: 4px solid {'#89b4fa' if is_dark else '#0969da'};
-            padding: 12px 16px;
-            border-radius: 6px;
-            margin: 14px 0;
-        }}
     </style>
 </head>
 <body>

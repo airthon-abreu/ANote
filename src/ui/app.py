@@ -5,6 +5,7 @@ import re
 import html
 import ctypes
 from ctypes import c_int, sizeof
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, List
 
@@ -20,7 +21,7 @@ from PySide6.QtCore import Qt, QUrl, QPoint, QObject, QEvent, QMarginsF
 from PySide6.QtGui import (
     QTextCursor, QTextCharFormat, QFont, QColor, QKeySequence, 
     QShortcut, QIcon, QTextDocument, QPdfWriter, QPageSize, QPageLayout,
-    QCloseEvent, QBrush, QTextFormat
+    QCloseEvent, QBrush, QTextFormat, QTextOption, QDesktopServices
 )
 
 from src.core.services import NotebookService
@@ -348,6 +349,9 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
+# =========================================================================
+# Janela Principal
+# =========================================================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -368,7 +372,10 @@ class MainWindow(QMainWindow):
         default_color = "#cdd6f4" if self.current_theme == "dark" else "#1f2328"
         self.text_color = self.service.get_text_color(default_color)
 
+        # 1. Constrói primeiro todos os componentes na tela
         self._setup_ui()
+
+        # 2. Agora aplica temas, atalhos e carrega os cadernos
         self._apply_theme(self.current_theme)
         self._bind_shortcuts()
         self._load_categories()
@@ -384,8 +391,9 @@ class MainWindow(QMainWindow):
         self.service.set_setting("theme", theme_name)
         apply_windows_dark_titlebar(self, dark=(theme_name == "dark"))
 
-        accent_color = "#89b4fa" if theme_name == "dark" else "#0969da"
-        self.lbl_term_title.setStyleSheet(f"font-weight: bold; font-size: 14px; color: {accent_color};")
+        if hasattr(self, "lbl_term_title"):
+            accent_color = "#89b4fa" if theme_name == "dark" else "#0969da"
+            self.lbl_term_title.setStyleSheet(f"font-weight: bold; font-size: 14px; color: {accent_color};")
 
     def _create_separator(self):
         line = QFrame()
@@ -442,13 +450,20 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(6, 4, 6, 4)
         main_layout.setSpacing(6)
 
+        # Leitor e Editor com Quebra Automática Obrigatória
         self.reader = QTextBrowser()
         self.reader.setOpenLinks(False)
         self.reader.anchorClicked.connect(self._on_anchor_clicked)
+        self.reader.setLineWrapMode(QTextBrowser.LineWrapMode.WidgetWidth)
+        self.reader.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.reader.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self.editor = QTextEdit()
         self.editor.cursorPositionChanged.connect(self._on_editor_cursor_moved)
         self.editor.textChanged.connect(self._update_status_bar)
+        self.editor.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.editor.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self.stack_center = QStackedWidget()
         self.stack_center.addWidget(self.reader)
@@ -469,6 +484,9 @@ class MainWindow(QMainWindow):
         menu_file.addAction("💾 Salvar Alterações", self._save_current_document)
         menu_file.addSeparator()
         menu_file.addAction("🕒 Histórico de Versões", self._open_history_dialog)
+        menu_file.addSeparator()
+        menu_file.addAction("🛡️ Fazer Backup dos Dados...", self._backup_database)
+        menu_file.addAction("🔄 Restaurar Backup (.db)...", self._restore_database)
         menu_file.addSeparator()
         menu_file.addAction("📥 Importar Caderno (.json)", self._import_document)
         menu_file.addAction("📤 Exportar para PDF / Markdown", self._export_current_document)
@@ -521,7 +539,6 @@ class MainWindow(QMainWindow):
         self.btn_font_color.clicked.connect(self._format_font_color)
         layout_toolbar.addWidget(self.btn_font_color)
 
-        # Botão para limpar fundo/destaque residual em seleções
         self.btn_clear_bg = QPushButton("🧹 Limpar Fundo")
         self.btn_clear_bg.setToolTip("Remove a cor de fundo e restaura a letra natural da seleção")
         self.btn_clear_bg.clicked.connect(self._clear_selection_highlight)
@@ -762,6 +779,76 @@ class MainWindow(QMainWindow):
             self._load_categories()
             self._load_documents()
 
+    def _backup_database(self):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"notebook_backup_{timestamp}.db"
+
+        backups_dir = Path(__file__).resolve().parent.parent.parent / "backups"
+        backups_dir.mkdir(parents=True, exist_ok=True)
+        default_target = str(backups_dir / default_name)
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Salvar Cópia de Segurança (Backup)",
+            default_target,
+            "Banco de Dados SQLite (*.db)"
+        )
+        if not file_path:
+            return
+
+        try:
+            if self.current_document_id and self.editor.document().isModified():
+                self._save_current_document()
+
+            saved_path = self.service.create_database_backup(Path(file_path))
+
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Backup Concluído")
+            msg_box.setText(f"<b>Cópia de segurança criada com sucesso!</b><br><br>Salvo em:<br><small>{saved_path}</small>")
+            msg_box.setIcon(QMessageBox.Icon.Information)
+
+            btn_open_folder = msg_box.addButton("Abrir Pasta", QMessageBox.ButtonRole.ActionRole)
+            msg_box.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
+
+            msg_box.exec()
+            if msg_box.clickedButton() == btn_open_folder:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(saved_path.parent)))
+
+        except Exception as e:
+            QMessageBox.critical(self, "Erro no Backup", f"Não foi possível gerar a cópia de segurança:\n{e}")
+
+    def _restore_database(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecionar Arquivo de Backup para Restaurar",
+            "",
+            "Banco de Dados SQLite (*.db)"
+        )
+        if not file_path:
+            return
+
+        confirm = QMessageBox.warning(
+            self,
+            "Confirmar Restauração",
+            "<b>ATENÇÃO:</b> Restaurar um backup substituirá todos os cadernos e anotações atuais pelos dados do arquivo selecionado.<br><br>Deseja continuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            success = self.service.restore_database_backup(Path(file_path))
+            if success:
+                self.document_cache.clear()
+                self._load_categories()
+                self._load_documents()
+                QMessageBox.information(self, "Sucesso", "Banco de dados restaurado com sucesso!")
+            else:
+                QMessageBox.warning(self, "Arquivo Inválido", "O arquivo selecionado não é um backup compatível do ANote.")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro na Restauração", f"Falha ao restaurar banco de dados:\n{e}")
+
     def _open_history_dialog(self):
         if not self.current_document_id:
             QMessageBox.information(self, "Aviso", "Selecione um caderno para ver seu histórico de versões.")
@@ -879,10 +966,6 @@ class MainWindow(QMainWindow):
     # ==========================================
 
     def _delete_active_term(self):
-        """
-        Desmarca o termo removendo fisicamente a âncora e a cor de fundo,
-        restaurando o texto à sua cor padrão natural e preservando negrito/itálico.
-        """
         if not self.current_anchor_key or not self.current_document_id:
             return
 
@@ -905,7 +988,6 @@ class MainWindow(QMainWindow):
         target_href = f"anchor:{self.current_anchor_key}"
         default_color = QColor("#cdd6f4" if self.current_theme == "dark" else "#1f2328")
 
-        # 1. Localiza cada fragmento do termo e faz a substituição cirúrgica
         while block.isValid():
             it = block.begin()
             while not it.atEnd():
@@ -917,7 +999,6 @@ class MainWindow(QMainWindow):
                         cur.setPosition(frag.position())
                         cur.setPosition(frag.position() + frag.length(), QTextCursor.MoveMode.KeepAnchor)
 
-                        # Constrói formato limpo preservando peso, itálico, sublinhado e fontes
                         clean_fmt = QTextCharFormat()
                         clean_fmt.setFontWeight(fmt.fontWeight())
                         clean_fmt.setFontItalic(fmt.fontItalic())
@@ -926,28 +1007,23 @@ class MainWindow(QMainWindow):
                         if fmt.fontPointSize() > 0:
                             clean_fmt.setFontPointSize(fmt.fontPointSize())
 
-                        # Limpa fisicamente o fundo (NoBrush) e desativa a âncora
                         clean_fmt.setAnchor(False)
                         clean_fmt.clearProperty(QTextFormat.Property.AnchorHref)
                         clean_fmt.setBackground(QBrush(Qt.BrushStyle.NoBrush))
                         clean_fmt.setForeground(default_color)
 
-                        # setCharFormat substitui o formato do trecho em vez de mesclar
                         cur.setCharFormat(clean_fmt)
                 it += 1
             block = block.next()
 
-        # 2. Exclui do banco SQLite
         self.service.delete_term(self.current_document_id, self.current_anchor_key)
 
-        # 3. Força a persistência dos dados tratados da memória para o banco e tela
         self._save_current_document()
         self._clear_active_term()
         self._update_status_bar()
         self.statusBar().showMessage("Termo desmarcado com sucesso!", 2500)
 
     def _clear_selection_highlight(self):
-        """Limpa qualquer fundo ou marcação da seleção atual no editor."""
         if self.stack_center.currentIndex() != 1:
             self._toggle_mode()
 
@@ -1044,14 +1120,12 @@ class MainWindow(QMainWindow):
         self._load_document_data(doc_id)
 
     def _save_current_document(self):
-        """Salva sempre a partir do self.editor, garantindo sincronia entre leitura e edição."""
         if not self.current_document_id:
             return
         new_title = self.input_doc_title.text().strip() or "Sem título"
         doc = self.service.get_document(self.current_document_id)
         cat = doc.category if doc else "Geral"
 
-        # O editor é a autoridade central em memória
         new_content = self.editor.toHtml()
 
         self.service.update_document(self.current_document_id, new_title, new_content, cat)
@@ -1257,14 +1331,20 @@ class MainWindow(QMainWindow):
         self.input_doc_title.setText(doc.title)
         self.lbl_category_badge.setText(f"📁 {doc.category}")
 
-        # Limpa automaticamente termos órfãos
         self.service.clean_orphaned_terms(doc_id, doc.content)
 
         if doc_id not in self.document_cache:
             qdoc = QTextDocument(self)
+            opt = QTextOption()
+            opt.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+            qdoc.setDefaultTextOption(opt)
             qdoc.setHtml(doc.content)
             qdoc.setModified(False)
             self.document_cache[doc_id] = qdoc
+        else:
+            opt = QTextOption()
+            opt.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+            self.document_cache[doc_id].setDefaultTextOption(opt)
 
         self.editor.setDocument(self.document_cache[doc_id])
         self._refresh_views()
