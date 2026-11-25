@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Generator
 from config import DB_PATH
 
+
 class Database:
     def __init__(self, db_path: Path = DB_PATH):
         self.db_path = db_path
@@ -32,6 +33,7 @@ class Database:
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
                     category TEXT DEFAULT 'Geral',
+                    card_color TEXT DEFAULT '',
                     content TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -70,6 +72,8 @@ class Database:
             doc_cols = [r["name"] for r in conn.execute("PRAGMA table_info(documents);").fetchall()]
             if "category" not in doc_cols:
                 conn.execute("ALTER TABLE documents ADD COLUMN category TEXT DEFAULT 'Geral';")
+            if "card_color" not in doc_cols:
+                conn.execute("ALTER TABLE documents ADD COLUMN card_color TEXT DEFAULT '';")
 
             term_cols = [r["name"] for r in conn.execute("PRAGMA table_info(terms);").fetchall()]
             if "color" not in term_cols:

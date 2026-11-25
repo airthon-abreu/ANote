@@ -2,14 +2,14 @@ import re
 import uuid
 import html
 import sqlite3
-import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Set
 
-from config import BASE_DIR, DB_PATH
+from config import BACKUPS_DIR
 from src.core.storage import Database
 from src.core.models import Document, Term
+from src.core.parser import TextParser
 
 
 def extract_anchors_from_html(content: str) -> Set[str]:
@@ -25,14 +25,33 @@ class NotebookService:
     def __init__(self, db: Optional[Database] = None):
         self.db = db or Database()
 
+    @staticmethod
+    def _row_to_document(row) -> Document:
+        data = dict(row)
+        data["category"] = data.get("category") or "Geral"
+        data["card_color"] = data.get("card_color") or ""
+        return Document(**data)
+
     # --- Operações de Documento ---
 
-    def create_document(self, title: str, content: str, category: str = "Geral") -> Document:
-        doc = Document(title=title.strip() or "Sem título", content=content, category=category.strip() or "Geral")
+    def create_document(
+        self,
+        title: str,
+        content: str,
+        category: str = "Geral",
+        card_color: str = ""
+    ) -> Document:
+        doc = Document(
+            title=title.strip() or "Sem título",
+            content=content,
+            category=category.strip() or "Geral",
+            card_color=card_color or ""
+        )
         with self.db.get_connection() as conn:
             conn.execute(
-                "INSERT INTO documents (id, title, category, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (doc.id, doc.title, doc.category, doc.content, doc.created_at, doc.updated_at)
+                """INSERT INTO documents (id, title, category, card_color, content, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (doc.id, doc.title, doc.category, doc.card_color, doc.content, doc.created_at, doc.updated_at)
             )
         self.save_history_snapshot(doc.id, doc.title, doc.content)
         return doc
@@ -41,12 +60,12 @@ class NotebookService:
         with self.db.get_connection() as conn:
             if category_filter and category_filter != "Todas":
                 rows = conn.execute(
-                    "SELECT * FROM documents WHERE category = ? ORDER BY updated_at DESC", 
+                    "SELECT * FROM documents WHERE category = ? ORDER BY updated_at DESC",
                     (category_filter,)
                 ).fetchall()
             else:
                 rows = conn.execute("SELECT * FROM documents ORDER BY updated_at DESC").fetchall()
-            return [Document(**dict(row)) for row in rows]
+            return [self._row_to_document(row) for row in rows]
 
     def list_categories(self) -> List[str]:
         with self.db.get_connection() as conn:
@@ -57,29 +76,52 @@ class NotebookService:
     def get_document(self, doc_id: str) -> Optional[Document]:
         with self.db.get_connection() as conn:
             row = conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
-            return Document(**dict(row)) if row else None
+            return self._row_to_document(row) if row else None
 
-    def update_document(self, doc_id: str, title: str, content: str, category: str = "Geral"):
+    def update_document(
+        self,
+        doc_id: str,
+        title: str,
+        content: str,
+        category: str = "Geral",
+        save_snapshot: bool = True,
+        clean_orphans: bool = True
+    ):
+        now_iso = datetime.now().isoformat()
+        clean_title = title.strip() or "Sem título"
+        clean_cat = category.strip() or "Geral"
         with self.db.get_connection() as conn:
             conn.execute(
-                "UPDATE documents SET title = ?, content = ?, category = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (title.strip() or "Sem título", content, category.strip() or "Geral", doc_id)
+                "UPDATE documents SET title = ?, content = ?, category = ?, updated_at = ? WHERE id = ?",
+                (clean_title, content, clean_cat, now_iso, doc_id)
             )
-        self.save_history_snapshot(doc_id, title, content)
-        self.clean_orphaned_terms(doc_id, content)
+        if save_snapshot:
+            self.save_history_snapshot(doc_id, clean_title, content)
+        if clean_orphans:
+            self.clean_orphaned_terms(doc_id, content)
 
     def rename_document(self, doc_id: str, new_title: str):
+        now_iso = datetime.now().isoformat()
         with self.db.get_connection() as conn:
             conn.execute(
-                "UPDATE documents SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (new_title.strip() or "Sem título", doc_id)
+                "UPDATE documents SET title = ?, updated_at = ? WHERE id = ?",
+                (new_title.strip() or "Sem título", now_iso, doc_id)
             )
 
     def update_document_category(self, doc_id: str, category: str):
+        now_iso = datetime.now().isoformat()
         with self.db.get_connection() as conn:
             conn.execute(
-                "UPDATE documents SET category = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (category.strip() or "Geral", doc_id)
+                "UPDATE documents SET category = ?, updated_at = ? WHERE id = ?",
+                (category.strip() or "Geral", now_iso, doc_id)
+            )
+
+    def update_document_card_color(self, doc_id: str, card_color: str):
+        now_iso = datetime.now().isoformat()
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE documents SET card_color = ?, updated_at = ? WHERE id = ?",
+                (card_color or "", now_iso, doc_id)
             )
 
     def delete_document(self, doc_id: str):
@@ -103,9 +145,16 @@ class NotebookService:
                 new_content
             )
             new_content = new_content.replace(f"|{t.anchor_key}]]", f"|{new_anchor}]]")
-            new_terms_to_insert.append((t.term_text, new_anchor, t.note_content, getattr(t, 'color', '#ffe066')))
+            new_terms_to_insert.append(
+                (t.term_text, new_anchor, t.note_content, getattr(t, "color", "#ffe066"))
+            )
 
-        new_doc = self.create_document(f"{original.title} (Cópia)", new_content, original.category)
+        new_doc = self.create_document(
+            f"{original.title} (Cópia)",
+            new_content,
+            original.category,
+            original.card_color
+        )
         for term_text, new_anchor, note_content, color in new_terms_to_insert:
             self.add_term_note(new_doc.id, term_text, new_anchor, note_content, color)
 
@@ -114,14 +163,10 @@ class NotebookService:
     # --- Backup e Restauração Atômica ---
 
     def create_database_backup(self, custom_path: Optional[Path] = None) -> Path:
-        """
-        Cria uma cópia de segurança atômica (online) do banco SQLite sem travar o app.
-        """
         if custom_path is None:
-            backups_dir = BASE_DIR / "backups"
-            backups_dir.mkdir(parents=True, exist_ok=True)
+            BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            target_path = backups_dir / f"notebook_backup_{timestamp}.db"
+            target_path = BACKUPS_DIR / f"notebook_backup_{timestamp}.db"
         else:
             target_path = Path(custom_path)
             target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -138,17 +183,16 @@ class NotebookService:
         return target_path
 
     def restore_database_backup(self, backup_file_path: Path) -> bool:
-        """
-        Valida e restaura o banco de dados a partir de um arquivo .db de backup.
-        """
         backup_path = Path(backup_file_path)
         if not backup_path.exists():
             return False
 
         test_conn = sqlite3.connect(backup_path)
         try:
-            row = test_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='documents';").fetchone()
-            if not row:
+            rows = test_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('documents', 'terms', 'settings');"
+            ).fetchall()
+            if len(rows) < 3:
                 return False
         except Exception:
             return False
@@ -170,22 +214,33 @@ class NotebookService:
 
     def save_history_snapshot(self, doc_id: str, title: str, content: str):
         history_id = str(uuid.uuid4())
-        now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        now_iso = datetime.now().isoformat(timespec="seconds")
         with self.db.get_connection() as conn:
+            last = conn.execute(
+                "SELECT title, content FROM document_history WHERE document_id = ? ORDER BY saved_at DESC LIMIT 1",
+                (doc_id,)
+            ).fetchone()
+            if last and last["title"] == title and last["content"] == content:
+                return
+
             conn.execute(
                 "INSERT INTO document_history (id, document_id, title, content, saved_at) VALUES (?, ?, ?, ?, ?)",
-                (history_id, doc_id, title, content, now_str)
+                (history_id, doc_id, title, content, now_iso)
             )
-            conn.execute("""
+            conn.execute(
+                """
                 DELETE FROM document_history WHERE id NOT IN (
                     SELECT id FROM document_history WHERE document_id = ? ORDER BY saved_at DESC LIMIT 20
                 ) AND document_id = ?
-            """, (doc_id, doc_id))
+                """,
+                (doc_id, doc_id)
+            )
 
     def list_history_snapshots(self, doc_id: str) -> List[Dict]:
         with self.db.get_connection() as conn:
             rows = conn.execute(
-                "SELECT id, title, saved_at, length(content) as content_len FROM document_history WHERE document_id = ? ORDER BY saved_at DESC", 
+                "SELECT id, title, saved_at, length(content) as content_len "
+                "FROM document_history WHERE document_id = ? ORDER BY saved_at DESC",
                 (doc_id,)
             ).fetchall()
             return [dict(r) for r in rows]
@@ -208,21 +263,24 @@ class NotebookService:
 
     def count_terms(self, document_id: str, content: Optional[str] = None) -> int:
         if content is not None:
-            active_anchors = extract_anchors_from_html(content)
-            self.clean_orphaned_terms(document_id, content)
-            return len(active_anchors)
+            return len(extract_anchors_from_html(content))
 
         doc = self.get_document(document_id)
         if doc:
-            active_anchors = extract_anchors_from_html(doc.content)
-            self.clean_orphaned_terms(document_id, doc.content)
-            return len(active_anchors)
+            return len(extract_anchors_from_html(doc.content))
 
         with self.db.get_connection() as conn:
             row = conn.execute("SELECT COUNT(*) as count FROM terms WHERE document_id = ?", (document_id,)).fetchone()
             return row["count"] if row else 0
 
-    def add_term_note(self, document_id: str, term_text: str, anchor_key: str, note_content: str, color: str = "#ffe066") -> Term:
+    def add_term_note(
+        self,
+        document_id: str,
+        term_text: str,
+        anchor_key: str,
+        note_content: str,
+        color: str = "#ffe066"
+    ) -> Term:
         term = Term(
             document_id=document_id,
             term_text=term_text,
@@ -238,19 +296,33 @@ class NotebookService:
             )
         return term
 
+    def restore_terms_snapshot(self, document_id: str, terms: List[Term]):
+        """Restaura exatamente um conjunto de termos (usado pelo Desfazer/Refazer global)."""
+        with self.db.get_connection() as conn:
+            conn.execute("DELETE FROM terms WHERE document_id = ?", (document_id,))
+            for t in terms:
+                conn.execute(
+                    """INSERT INTO terms (id, document_id, term_text, anchor_key, note_content, color, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (t.id, document_id, t.term_text, t.anchor_key, t.note_content, t.color, t.created_at)
+                )
+
     def get_note_by_anchor(self, anchor_key: str) -> Optional[Term]:
         with self.db.get_connection() as conn:
-            row = conn.execute("SELECT * FROM terms WHERE anchor_key = ?", (anchor_key,))
-            row = row.fetchone()
+            row = conn.execute("SELECT * FROM terms WHERE anchor_key = ?", (anchor_key,)).fetchone()
             return Term(**dict(row)) if row else None
 
-    def list_terms_for_document(self, document_id: str) -> List[Term]:
-        doc = self.get_document(document_id)
-        if doc:
-            self.clean_orphaned_terms(document_id, doc.content)
+    def list_terms_for_document(self, document_id: str, clean_orphans: bool = True) -> List[Term]:
+        if clean_orphans:
+            doc = self.get_document(document_id)
+            if doc:
+                self.clean_orphaned_terms(document_id, doc.content)
 
         with self.db.get_connection() as conn:
-            rows = conn.execute("SELECT * FROM terms WHERE document_id = ? ORDER BY created_at ASC", (document_id,)).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM terms WHERE document_id = ? ORDER BY created_at ASC",
+                (document_id,)
+            ).fetchall()
             return [Term(**dict(row)) for row in rows]
 
     def update_term_note(self, anchor_key: str, new_note: str):
@@ -303,16 +375,21 @@ class NotebookService:
             return None
 
         terms = self.list_terms_for_document(doc_id)
-        content = doc.content
-        content = re.sub(r'font-size:\s*[^;"]+;?', '', content)
-        content = re.sub(r'color:\s*#[0-9a-fA-F]+;?', '', content)
+        content = TextParser.extract_body_inner(doc.content)
+        content = re.sub(r'(?<![a-zA-Z-])font-size:\s*[^;"]+;?', "", content)
+        content = re.sub(r'(?<![a-zA-Z-])color:\s*#[0-9a-fA-F]+;?', "", content)
 
         for t in terms:
             badge = (
                 f'<span style="background-color: {t.color}; color: #111111; '
                 f'padding: 2px 6px; border-radius: 4px;">{html.escape(t.term_text)}</span>'
             )
-            content = re.sub(rf'<a\s+[^>]*href=["\']anchor:{re.escape(t.anchor_key)}["\'][^>]*>(.*?)</a>', badge, content)
+            content = re.sub(
+                rf'<a\s+[^>]*href=["\']anchor:{re.escape(t.anchor_key)}["\'][^>]*>(.*?)</a>',
+                lambda _, b=badge: b,
+                content,
+                flags=re.DOTALL
+            )
 
         glossary_section = ""
         if terms:
@@ -379,16 +456,17 @@ class NotebookService:
 
         terms = self.list_terms_for_document(doc_id)
         return {
-            "version": "1.2",
+            "version": "1.3",
             "title": doc.title,
             "category": doc.category,
+            "card_color": doc.card_color,
             "content": doc.content,
             "terms": [
                 {
                     "term_text": t.term_text,
                     "anchor_key": t.anchor_key,
                     "note_content": t.note_content,
-                    "color": getattr(t, 'color', '#ffe066')
+                    "color": getattr(t, "color", "#ffe066")
                 }
                 for t in terms
             ]
@@ -401,6 +479,7 @@ class NotebookService:
         content = data["content"]
         raw_terms = data.get("terms", [])
         category = data.get("category", "Geral")
+        card_color = data.get("card_color", "")
         remapped_terms = []
 
         for t in raw_terms:
@@ -411,12 +490,16 @@ class NotebookService:
             color = t.get("color", "#ffe066")
 
             if old_anchor:
-                content = re.sub(rf'href=["\']anchor:{re.escape(old_anchor)}["\']', f'href="anchor:{new_anchor}"', content)
-                content = content.replace(f'|{old_anchor}]]', f'|{new_anchor}]]')
+                content = re.sub(
+                    rf'href=["\']anchor:{re.escape(old_anchor)}["\']',
+                    f'href="anchor:{new_anchor}"',
+                    content
+                )
+                content = content.replace(f"|{old_anchor}]]", f"|{new_anchor}]]")
 
             remapped_terms.append((term_text, new_anchor, note_content, color))
 
-        new_doc = self.create_document(data["title"], content, category)
+        new_doc = self.create_document(data["title"], content, category, card_color)
         for term_text, new_anchor, note_content, color in remapped_terms:
             self.add_term_note(new_doc.id, term_text, new_anchor, note_content, color)
 
@@ -428,12 +511,17 @@ class NotebookService:
             return None
 
         terms = self.list_terms_for_document(doc_id)
-        clean_text = doc.content
-        clean_text = re.sub(r'<a\s+[^>]*href=["\']anchor:[^"\']+["\'][^>]*>(.*?)</a>', r'**\1**', clean_text)
-        clean_text = re.sub(r'</p>', '\n\n', clean_text)
-        clean_text = re.sub(r'<br\s*/?>', '\n', clean_text)
-        clean_text = re.sub(r'<[^>]+>', '', clean_text)
-        clean_text = html.unescape(clean_text).replace('\xa0', ' ').strip()
+        clean_text = TextParser.extract_body_inner(doc.content)
+        clean_text = re.sub(
+            r'<a\s+[^>]*href=["\']anchor:[^"\']+["\'][^>]*>(.*?)</a>',
+            r"**\1**",
+            clean_text,
+            flags=re.DOTALL
+        )
+        clean_text = re.sub(r"</p>", "\n\n", clean_text, flags=re.IGNORECASE)
+        clean_text = re.sub(r"<br\s*/?>", "\n", clean_text, flags=re.IGNORECASE)
+        clean_text = re.sub(r"<[^>]+>", "", clean_text)
+        clean_text = html.unescape(clean_text).replace("\xa0", " ").strip()
 
         md_lines = [
             f"# {doc.title}\n",

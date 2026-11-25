@@ -13,11 +13,16 @@ dist/
 *.spec
 
 # Dados de usuário e banco local (portabilidade)
+data/*.db
+data/*.db-wal
+data/*.db-shm
+!data/.gitkeep
 backups/*
 !backups/.gitkeep
 
 # IDEs
 .vscode/
 .idea/
+
 # Handoff snapshot
 handoff_projeto.txt
